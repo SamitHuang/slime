@@ -1,17 +1,23 @@
 ### 阶段一：打通Qwen2.5-0.5B GRPO 8卡同步/异步训练（train.py和train_async.py），GSM8K 数据集，loss/reward 收敛与 SGLang backend 基本一致，且满足确定性计算，多次重复运行Loss曲线完全一致。
 
+First Design and RFC by 03/06 
+
 #### 初步方案：
 - 对标SGLang，Slime 在 Ray 内管理 vLLM 的完整生命周期，包括进程拉起、权重同步、推理暂停/恢复
 - 暂不使用Router，SGLang Model Gateway仅只支持SGLang Worker，SlimeRouter仅在 R3 / radix-tree caching 时需要，Qwen2.5-0.5B 非 MoE 且用 token-in/token-out
 - 单vLLM实例，无router，通过vLLMClient 直连本地 vLLM 进程端口
-- 若训推不共卡，权重同步采用NCCL broadcast，对标SGLang update_weights_from_distributed  (默认，优先用于支持异步训推）
-- 若colocate，权重同步采用GPU IPC（vLLM update_weights_from_ipc, update_weights_from_tensor），对标SGLang update_weights_from_tensor
+- 先支持和验证colocate，权重同步采用GPU IPC（vLLM update_weights_from_ipc, update_weights_from_tensor），对标SGLang update_weights_from_tensor，以验证Reproductivity
+- 再支持训推不共卡，权重同步采用NCCL broadcast，对标SGLang update_weights_from_distributed  (默认）
 
 #### 风险：
 - slime, sglang版本依赖，和vllm 0.16的版本依赖冲突(numpy, torch, transformers, etc)
+- slime代码较挫，可靠性差，强依赖preset docker
 - 算力
 
-First Design and RFC by 03/06 
+
+#### Reference
+
+https://thudm.github.io/slime/advanced/reproducibility.html
 
 
 ### 阶段二：接入vllm-project/router，支持多实例vLLM
