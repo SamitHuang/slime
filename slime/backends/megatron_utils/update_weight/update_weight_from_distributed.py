@@ -1,3 +1,4 @@
+import os
 import socket
 import time
 from argparse import Namespace
@@ -241,12 +242,17 @@ class UpdateWeightFromDistributed:
             self.weight_version,
             self.rollout_engines,
             converted_named_tensors,
+            use_vllm=_is_vllm_backend(self.args),
         )
 
         ray.get(refs)
         converted_named_tensors.clear()
         ray.get(self.rollout_engine_lock.release.remote())
         pbar.update(1)
+
+
+def _is_vllm_backend(args: Namespace) -> bool:
+    return getattr(args, "rollout_backend", "sglang") == "vllm"
 
 
 def connect_rollout_engines_from_distributed(
@@ -261,6 +267,10 @@ def connect_rollout_engines_from_distributed(
     ``engine_gpu_counts`` gives the number of GPUs per engine.  When engines
     have heterogeneous TP sizes (e.g. prefill TP=2, decode TP=4), each engine
     occupies a different number of ranks in the NCCL group.
+
+    For vLLM backend, uses vLLM's StatelessProcessGroup + PyNcclCommunicator
+    instead of torch.distributed, because vLLM's weight transfer engine uses
+    its own NCCL initialization protocol.
     """
     if engine_gpu_counts is None:
         engine_gpu_counts = [args.rollout_num_gpus_per_engine] * len(rollout_engines)
@@ -287,13 +297,39 @@ def connect_rollout_engines_from_distributed(
         )
         for i, engine in enumerate(rollout_engines)
     ]
-    model_update_groups = init_process_group(
-        backend="nccl",
-        init_method=f"tcp://{master_address}:{master_port}",
-        world_size=world_size,
-        rank=0,
-        group_name=group_name,
-    )
+
+    if _is_vllm_backend(args):
+        # vLLM uses StatelessProcessGroup + PyNcclCommunicator for weight transfer.
+        # The training side must use the same mechanism for NCCL compatibility.
+        #
+        # Disable P2P transport: in colocate mode the trainer and vLLM server
+        # share the same physical GPU but have different CUDA_VISIBLE_DEVICES,
+        # which causes NCCL P2P (cudaIpc*) to fail with "invalid argument".
+        # SHM transport works correctly in this scenario.
+        from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
+
+        old_p2p = os.environ.get("NCCL_P2P_DISABLE")
+        os.environ["NCCL_P2P_DISABLE"] = "1"
+        try:
+            model_update_groups = NCCLWeightTransferEngine.trainer_init({
+                "master_address": master_address,
+                "master_port": master_port,
+                "world_size": world_size,
+            })
+        finally:
+            if old_p2p is None:
+                os.environ.pop("NCCL_P2P_DISABLE", None)
+            else:
+                os.environ["NCCL_P2P_DISABLE"] = old_p2p
+    else:
+        model_update_groups = init_process_group(
+            backend="nccl",
+            init_method=f"tcp://{master_address}:{master_port}",
+            world_size=world_size,
+            rank=0,
+            group_name=group_name,
+        )
+
     ray.get(refs)
     return model_update_groups
 
@@ -303,19 +339,24 @@ def disconnect_rollout_engines_from_distributed(args, group_name, model_update_g
     Destroy NCCL on training and engines.
     """
     refs = [engine.destroy_weights_update_group.remote(group_name) for engine in rollout_engines]
-    dist.destroy_process_group(model_update_groups)
+    if _is_vllm_backend(args):
+        model_update_groups = None
+    else:
+        dist.destroy_process_group(model_update_groups)
     ray.get(refs)
 
 
 def update_weights_from_distributed(
     group_name: str,
-    group: dist.ProcessGroup,
+    group,
     weight_version: int,
     rollout_engines: Sequence[ActorHandle],
     converted_named_tensors: Sequence[tuple[str, torch.Tensor]],
+    use_vllm: bool = False,
 ) -> list[ObjectRef]:
     """
     Send metadata (Ray), broadcast tensors (NCCL rank 0 → engines).
+    For vLLM, uses PyNcclCommunicator.broadcast instead of dist.broadcast.
     """
     refs = [
         engine.update_weights_from_distributed.remote(
@@ -328,11 +369,15 @@ def update_weights_from_distributed(
         for engine in rollout_engines
     ]
 
-    handles = []
-    for _, param in converted_named_tensors:
-        handles.append(dist.broadcast(param.data, 0, group=group, async_op=True))
-    for handle in handles:
-        handle.wait()
+    if use_vllm:
+        for _, param in converted_named_tensors:
+            group.broadcast(param.data, src=0, stream=torch.cuda.current_stream())
+    else:
+        handles = []
+        for _, param in converted_named_tensors:
+            handles.append(dist.broadcast(param.data, 0, group=group, async_op=True))
+        for handle in handles:
+            handle.wait()
 
     return refs
 

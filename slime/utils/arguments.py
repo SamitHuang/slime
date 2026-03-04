@@ -239,6 +239,25 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--rollout-backend",
+                type=str,
+                choices=["sglang", "vllm"],
+                default="sglang",
+                help="Rollout inference backend: sglang (default) or vllm.",
+            )
+            parser.add_argument(
+                "--vllm-base-url",
+                type=str,
+                default=None,
+                help="vLLM server URL (set automatically when using managed vLLM).",
+            )
+            parser.add_argument(
+                "--vllm-max-retries",
+                type=int,
+                default=3,
+                help="Max HTTP retries for vLLM requests.",
+            )
+            parser.add_argument(
                 "--rollout-function-path",
                 type=str,
                 default="slime.rollout.sglang_rollout.generate_rollout",
@@ -1484,8 +1503,16 @@ def parse_args(add_custom_arguments=None):
     if pre.train_backend == "megatron" and not args.debug_rollout_only:
         megatron_validate_args(args)
 
-    if not args.debug_train_only:
+    if not args.debug_train_only and getattr(args, "rollout_backend", "sglang") == "sglang":
         sglang_validate_args(args)
+    elif getattr(args, "rollout_backend", "sglang") == "vllm":
+        # Set sglang aliases that the rest of the codebase expects
+        args.sglang_dp_size = getattr(args, "sglang_data_parallel_size", 1) or 1
+        args.sglang_pp_size = getattr(args, "sglang_pipeline_parallel_size", 1) or 1
+        args.sglang_ep_size = getattr(args, "sglang_expert_parallel_size", 1) or 1
+        args.sglang_tp_size = args.rollout_num_gpus_per_engine
+        if not hasattr(args, "sglang_speculative_algorithm"):
+            args.sglang_speculative_algorithm = None
 
     return args
 
