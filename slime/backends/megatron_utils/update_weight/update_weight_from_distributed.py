@@ -1,5 +1,5 @@
 import logging
-import multiprocessing as mp
+import torch.multiprocessing as mp
 import os
 import socket
 import time
@@ -37,10 +37,13 @@ logger = logging.getLogger(__name__)
 def _nccl_bridge_worker(conn, master_address, master_port, world_size, device, cvd, env_snapshot):
     """Subprocess entry-point: creates PyNcclCommunicator and serves requests.
 
+    GPU tensors are shared from the parent via CUDA IPC (torch.multiprocessing
+    handles this transparently).  No GPU→CPU→GPU copies are needed.
+
     Protocol over *conn* (multiprocessing.Connection):
         parent → child:
-            {"op": "broadcast", "tensors": [cpu_tensor, ...]}
-            {"op": "send_packed", "named_tensors": [(name, cpu_tensor), ...]}
+            {"op": "broadcast", "tensors": [gpu_tensor, ...]}
+            {"op": "send_packed", "named_tensors": [(name, gpu_tensor), ...]}
             None  → shutdown
         child → parent:
             "ready"  (after init)
@@ -53,6 +56,7 @@ def _nccl_bridge_worker(conn, master_address, master_port, world_size, device, c
             os.environ["CUDA_VISIBLE_DEVICES"] = cvd
 
         import torch
+        import torch.multiprocessing  # ensure CUDA IPC reducers are registered
         torch.cuda.set_device(device)
 
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
@@ -72,10 +76,8 @@ def _nccl_bridge_worker(conn, master_address, master_port, world_size, device, c
 
             op = cmd["op"]
             if op == "broadcast":
-                for cpu_t in cmd["tensors"]:
-                    gpu_t = cpu_t.cuda(device)
-                    comm.broadcast(gpu_t, src=0, stream=torch.cuda.current_stream())
-                    del gpu_t
+                for t in cmd["tensors"]:
+                    comm.broadcast(t, src=0, stream=torch.cuda.current_stream())
                 torch.cuda.synchronize()
                 conn.send("ok")
 
@@ -84,14 +86,8 @@ def _nccl_bridge_worker(conn, master_address, master_port, world_size, device, c
                     NCCLWeightTransferEngine,
                 )
 
-                named_tensors = cmd["named_tensors"]
-
-                def _gpu_iter():
-                    for name, cpu_t in named_tensors:
-                        yield (name, cpu_t.cuda(device).contiguous())
-
                 NCCLWeightTransferEngine.trainer_send_weights(
-                    iterator=_gpu_iter(),
+                    iterator=iter(cmd["named_tensors"]),
                     group=comm,
                     packed=True,
                 )
@@ -110,9 +106,9 @@ class _NcclBridge:
     """Runs vLLM's PyNcclCommunicator in a separate subprocess.
 
     This prevents NCCL communicator conflicts with torch.distributed groups
-    that already exist in the Megatron trainer process.  Communication between
-    the trainer and the bridge uses a multiprocessing Pipe; GPU tensors are
-    staged through CPU (pinned memory when possible) for the transfer.
+    that already exist in the Megatron trainer process.  GPU tensors are shared
+    with the subprocess via CUDA IPC (handled transparently by
+    torch.multiprocessing), avoiding any GPU→CPU→GPU copies.
     """
 
     def __init__(self, master_address: str, master_port: int, world_size: int, device: int):
@@ -140,17 +136,17 @@ class _NcclBridge:
 
     def broadcast_tensors(self, tensors: list[torch.Tensor]) -> None:
         """Broadcast a list of tensors (one-by-one) via the bridge subprocess."""
-        cpu_tensors = [t.cpu().contiguous() for t in tensors]
-        self._parent_conn.send({"op": "broadcast", "tensors": cpu_tensors})
+        gpu_tensors = [t.contiguous() for t in tensors]
+        self._parent_conn.send({"op": "broadcast", "tensors": gpu_tensors})
         self._wait_ok("broadcast_tensors")
 
     def send_weights_packed(self, named_tensors: list[tuple[str, torch.Tensor]]) -> None:
         """Send weights using vLLM's packed broadcast protocol."""
-        cpu_pairs = []
+        gpu_pairs = []
         for name, t in named_tensors:
             data = t.data if hasattr(t, "data") else t
-            cpu_pairs.append((name, data.cpu().contiguous()))
-        self._parent_conn.send({"op": "send_packed", "named_tensors": cpu_pairs})
+            gpu_pairs.append((name, data.contiguous()))
+        self._parent_conn.send({"op": "send_packed", "named_tensors": gpu_pairs})
         self._wait_ok("send_weights_packed")
 
     def _wait_ok(self, label: str, timeout: float = 600.0) -> None:
