@@ -50,12 +50,18 @@ class RayTrainGroup:
         assert pg is not None
         pg, reordered_bundle_indices, _reordered_gpu_ids = pg
 
+        # Restrict CUDA_VISIBLE_DEVICES to only this group's GPUs so that
+        # NCCL / PyTorch do not allocate memory on rollout GPUs.
+        trainer_gpu_ids = [_reordered_gpu_ids[rank] for rank in range(world_size)]
+        trainer_cvd = ",".join(str(g) for g in trainer_gpu_ids)
+
         env_vars = {
             # because sglang will always set NCCL_CUMEM_ENABLE to 0
             # we need also set it to 0 to prevent nccl error.
             "NCCL_CUMEM_ENABLE": os.environ.get("NCCL_CUMEM_ENABLE", "0"),
             "NVTE_FP8_BLOCK_SCALING_FP32_SCALES": os.environ.get("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "1"),
             **{name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST},
+            "CUDA_VISIBLE_DEVICES": trainer_cvd,
             **self.args.train_env_vars,
         }
 

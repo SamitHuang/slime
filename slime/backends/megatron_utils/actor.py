@@ -128,7 +128,8 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.vocab_size is None:
             self.args.vocab_size = self.tokenizer.vocab_size
 
-        update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
+        use_tensor_update = self.args.colocate and getattr(self.args, "rollout_backend", "sglang") != "vllm"
+        update_weight_cls = UpdateWeightFromTensor if use_tensor_update else UpdateWeightFromDistributed
         self.weight_updater = update_weight_cls(
             self.args,
             self.model,

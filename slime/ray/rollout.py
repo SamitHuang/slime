@@ -16,6 +16,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
 from slime.backends.sglang_utils.sglang_engine import SGLangEngine
+from slime.backends.vllm_utils.vllm_engine import VLLMEngine
 from slime.rollout.base_types import call_rollout_fn
 from slime.utils import logging_utils
 from slime.utils.health_monitor import RolloutHealthMonitor
@@ -1020,6 +1021,49 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
     return router_ip, router_port
 
 
+def _start_vllm_rollout_servers(args, pg) -> dict[str, RolloutServer]:
+    """Start vLLM rollout server (single instance, no router)."""
+    pg_obj, reordered_bundle_indices, reordered_gpu_ids = pg
+    tp = args.rollout_num_gpus_per_engine
+    gpu_ids = [int(reordered_gpu_ids[i]) for i in range(tp)]
+    scheduling_strategy = PlacementGroupSchedulingStrategy(
+        placement_group=pg_obj,
+        placement_group_capture_child_tasks=True,
+        placement_group_bundle_index=reordered_bundle_indices[0],
+    )
+
+    env_vars = {name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST}
+
+    VLLMRayActor = ray.remote(VLLMEngine)
+    engine = VLLMRayActor.options(
+        num_cpus=0.2,
+        num_gpus=0.2,
+        scheduling_strategy=scheduling_strategy,
+        runtime_env={"env_vars": env_vars},
+    ).remote(args, rank=0, base_gpu_id=gpu_ids[0], gpu_ids=gpu_ids)
+
+    host, port = ray.get(engine._get_current_node_ip_and_free_port.remote(start_port=15000))
+    ray.get(engine.init.remote(port=port, host=host))
+    args.vllm_base_url = f"http://{host}:{port}"
+    args.sglang_router_ip = host
+    args.sglang_router_port = port
+
+    group = EngineGroup(
+        args=args,
+        pg=pg,
+        all_engines=[engine],
+        num_gpus_per_engine=args.rollout_num_gpus_per_engine,
+        num_new_engines=1,
+        worker_type="regular",
+        rank_offset=0,
+        gpu_offset=0,
+        sglang_overrides={},
+        router_ip=host,
+        router_port=port,
+    )
+    return {"default": RolloutServer(engine_groups=[group], router_ip=host, router_port=port, model_name="default")}
+
+
 def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
     """Start rollout servers: one per model, each with its own router.
 
@@ -1033,6 +1077,9 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
     Note: ``init_http_client`` should be called separately before this,
     as the HTTP client is shared across all servers.
     """
+    if getattr(args, "rollout_backend", "sglang") == "vllm":
+        return _start_vllm_rollout_servers(args, pg)
+
     config = _resolve_sglang_config(args)
 
     servers: dict[str, RolloutServer] = {}
