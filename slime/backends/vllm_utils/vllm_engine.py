@@ -62,6 +62,7 @@ class VLLMEngine(RayActor):
         env.setdefault("NCCL_DEBUG", "INFO")
         env.setdefault("NCCL_DEBUG_SUBSYS", "ALL")
         env["NCCL_P2P_DISABLE"] = "1"
+        env.setdefault("NCCL_IB_DISABLE", "1")
 
         self._log_file = tempfile.NamedTemporaryFile(
             prefix="vllm_engine_", suffix=".log", delete=False, mode="w"
@@ -145,8 +146,11 @@ class VLLMEngine(RayActor):
 
     def init_weights_update_group(self, master_address, master_port, rank_offset, world_size, group_name=None, backend=None):
         logger.info(
-            "Initializing NCCL weight transfer: master=%s:%s, rank_offset=%d, world_size=%d",
+            "Initializing NCCL weight transfer: master=%s:%s, rank_offset=%d, "
+            "world_size=%d, vllm_url=http://%s:%s, vllm_log=%s",
             master_address, master_port, rank_offset, world_size,
+            self.server_host, self.server_port,
+            self._log_file.name if self._log_file else "<none>",
         )
         self._post("/init_weight_transfer_engine", json_data={
             "init_info": {
@@ -156,8 +160,19 @@ class VLLMEngine(RayActor):
                 "world_size": world_size,
             }
         })
+        log_tail = self._read_log_tail(30)
+        logger.info("vLLM log after init_weight_transfer_engine:\n%s", log_tail)
 
-    def update_weights_from_distributed(self, names, dtypes, shapes, group_name=None, flush_cache=False, weight_version=None):
+    def update_weights_from_distributed(
+        self,
+        names,
+        dtypes,
+        shapes,
+        group_name=None,
+        flush_cache=False,
+        weight_version=None,
+        packed: bool = True,
+    ):
         dtype_names = [str(d).replace("torch.", "") for d in dtypes]
         shape_lists = [list(s) for s in shapes]
         self._post("/update_weights", json_data={
@@ -165,7 +180,7 @@ class VLLMEngine(RayActor):
                 "names": names,
                 "dtype_names": dtype_names,
                 "shapes": shape_lists,
-                "packed": False,
+                "packed": packed,
             }
         })
 

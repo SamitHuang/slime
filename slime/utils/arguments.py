@@ -258,6 +258,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Max HTTP retries for vLLM requests.",
             )
             parser.add_argument(
+                "--vllm-weight-sync-packed",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help="Use vLLM packed weight transfer for non-colocate (default: True). Disable for per-bucket mode.",
+            )
+            parser.add_argument(
                 "--rollout-function-path",
                 type=str,
                 default="slime.rollout.sglang_rollout.generate_rollout",
