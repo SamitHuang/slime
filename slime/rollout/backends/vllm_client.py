@@ -44,9 +44,11 @@ class VLLMClient(RolloutBackendClient):
             "stop": sp.get("stop"),
             "stop_token_ids": sp.get("stop_token_ids"),
             "skip_special_tokens": sp.get("skip_special_tokens", True),
+            "spaces_between_special_tokens": sp.get("spaces_between_special_tokens", False),
             "logprobs": 1 if request.return_logprob else None,
             "include_stop_str_in_output": sp.get("no_stop_trim", False),
             "return_token_ids": True,
+            "seed": sp.get("sampling_seed"),
         }
         payload = {k: v for k, v in payload.items() if v is not None}
 

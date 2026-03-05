@@ -26,6 +26,7 @@ CKPT_ARGS=(
    --ref-load /root/Qwen2.5-0.5B-Instruct_torch_dist/
 )
 
+# num-rollout:100
 ROLLOUT_ARGS=(
    --prompt-data /root/gsm8k/train.parquet
    --input-key messages
@@ -33,7 +34,7 @@ ROLLOUT_ARGS=(
    --apply-chat-template
    --rollout-shuffle
    --rm-type math
-   --num-rollout 100
+   --num-rollout 500
    --rollout-batch-size 32
    --n-samples-per-prompt 8
    --rollout-max-response-len 1024

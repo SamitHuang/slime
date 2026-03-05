@@ -42,12 +42,15 @@ class VLLMEngine(RayActor):
         else:
             dev_str = ",".join(str(g) for g in gpu_ids)
 
+        seed = getattr(self.args, "seed", 1234) + self.rank
         cmd = [
             "vllm", "serve", model,
             "--tensor-parallel-size", str(tp),
             "--port", str(self.server_port),
             "--host", "0.0.0.0",
             "--weight-transfer-config", '{"backend": "nccl"}',
+            "--seed", str(seed),
+            "--trust-remote-code",
         ]
         if getattr(self.args, "offload_rollout", False):
             cmd.append("--enable-sleep-mode")
