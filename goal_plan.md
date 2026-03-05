@@ -6,8 +6,8 @@ First Design and RFC by 03/06
 - 对标SGLang，Slime 在 Ray 内管理 vLLM 的完整生命周期，包括进程拉起、权重同步、推理暂停/恢复
 - 暂不使用Router，SGLang Model Gateway仅只支持SGLang Worker，SlimeRouter仅在 R3 / radix-tree caching 时需要，Qwen2.5-0.5B 非 MoE 且用 token-in/token-out
 - 单vLLM实例，无router，通过vLLMClient 直连本地 vLLM 进程端口
-- 先支持和验证colocate，权重同步采用GPU IPC（vLLM update_weights_from_ipc, update_weights_from_tensor），对标SGLang update_weights_from_tensor，以验证Reproductivity
-- 再支持训推不共卡，权重同步采用NCCL broadcast，对标SGLang update_weights_from_distributed  (默认）
+- 先支持训推不共卡(non-colocate)，权重同步采用NCCL broadcast，对标SGLang update_weights_from_distributed  (默认）
+- 再支持和验证colocate，权重同步采用GPU IPC（vLLM update_weights_from_ipc, update_weights_from_tensor），对标SGLang update_weights_from_tensor，以验证Reproductivity。**IPC 依赖vllm 0.17**
 
 #### 风险：
 - slime, sglang版本依赖，和vllm 0.16的版本依赖冲突(numpy, torch, transformers, etc)
