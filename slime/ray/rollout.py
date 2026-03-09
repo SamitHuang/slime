@@ -1022,46 +1022,87 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
 
 
 def _start_vllm_rollout_servers(args, pg) -> dict[str, RolloutServer]:
-    """Start vLLM rollout server (single instance, no router)."""
+    """Start vLLM rollout server(s) with optional SlimeRouter.
+
+    When ``args.use_slime_router`` is True, a SlimeRouter is launched first
+    and each vLLM engine registers its translation sidecar with the router.
+    Otherwise, a single engine is started and used directly (no router).
+    """
     pg_obj, reordered_bundle_indices, reordered_gpu_ids = pg
     tp = args.rollout_num_gpus_per_engine
-    gpu_ids = [int(reordered_gpu_ids[i]) for i in range(tp)]
-    scheduling_strategy = PlacementGroupSchedulingStrategy(
-        placement_group=pg_obj,
-        placement_group_capture_child_tasks=True,
-        placement_group_bundle_index=reordered_bundle_indices[0],
-    )
+    num_gpu_per_engine_local = min(tp, args.num_gpus_per_node)
+    num_engines = max(1, args.rollout_num_gpus // num_gpu_per_engine_local)
+
+    use_router = getattr(args, "use_slime_router", False)
+
+    # --- Launch the SlimeRouter if requested ---
+    if use_router:
+        router_ip, router_port = _start_router(args, has_pd_disaggregation=False)
+        args.sglang_router_ip = router_ip
+        args.sglang_router_port = router_port
+    else:
+        router_ip = None
+        router_port = None
 
     env_vars = {name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST}
-
     VLLMRayActor = ray.remote(VLLMEngine)
-    engine = VLLMRayActor.options(
-        num_cpus=0.2,
-        num_gpus=0.2,
-        scheduling_strategy=scheduling_strategy,
-        runtime_env={"env_vars": env_vars},
-    ).remote(args, rank=0, base_gpu_id=gpu_ids[0], gpu_ids=gpu_ids)
 
-    host, port = ray.get(engine._get_current_node_ip_and_free_port.remote(start_port=15000))
-    ray.get(engine.init.remote(port=port, host=host))
-    args.vllm_base_url = f"http://{host}:{port}"
-    args.sglang_router_ip = host
-    args.sglang_router_port = port
+    engines = []
+    init_handles = []
+    for i in range(num_engines):
+        gpu_index = i * num_gpu_per_engine_local
+        gpu_ids = [int(reordered_gpu_ids[gpu_index + j]) for j in range(num_gpu_per_engine_local)]
+        scheduling_strategy = PlacementGroupSchedulingStrategy(
+            placement_group=pg_obj,
+            placement_group_capture_child_tasks=True,
+            placement_group_bundle_index=reordered_bundle_indices[gpu_index],
+        )
+
+        engine = VLLMRayActor.options(
+            num_cpus=0.2,
+            num_gpus=0.2,
+            scheduling_strategy=scheduling_strategy,
+            runtime_env={"env_vars": env_vars},
+        ).remote(args, rank=i, base_gpu_id=gpu_ids[0], gpu_ids=gpu_ids)
+
+        host, port = ray.get(engine._get_current_node_ip_and_free_port.remote(start_port=15000 + i * 10))
+
+        init_handles.append(
+            engine.init.remote(
+                port=port,
+                host=host,
+                router_ip=router_ip,
+                router_port=router_port,
+            )
+        )
+        engines.append(engine)
+
+        # Use the first engine's host for args if no router
+        if i == 0 and not use_router:
+            args.vllm_base_url = f"http://{host}:{port}"
+            args.sglang_router_ip = host
+            args.sglang_router_port = port
+
+    # Wait for all engines to be healthy + registered with router
+    ray.get(init_handles)
+
+    first_host = args.sglang_router_ip
+    first_port = args.sglang_router_port
 
     group = EngineGroup(
         args=args,
         pg=pg,
-        all_engines=[engine],
+        all_engines=engines,
         num_gpus_per_engine=args.rollout_num_gpus_per_engine,
-        num_new_engines=1,
+        num_new_engines=num_engines,
         worker_type="regular",
         rank_offset=0,
         gpu_offset=0,
         sglang_overrides={},
-        router_ip=host,
-        router_port=port,
+        router_ip=first_host,
+        router_port=first_port,
     )
-    return {"default": RolloutServer(engine_groups=[group], router_ip=host, router_port=port, model_name="default")}
+    return {"default": RolloutServer(engine_groups=[group], router_ip=first_host, router_port=first_port, model_name="default")}
 
 
 def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
