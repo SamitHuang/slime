@@ -2,7 +2,7 @@ import logging
 
 from slime.rollout.backends.base_client import BackendCapabilities, RolloutBackendClient
 from slime.rollout.base_types import RolloutBackendRequest, RolloutBackendResponse
-from slime.utils.http_utils import post
+from slime.utils.http_utils import get, post
 
 logger = logging.getLogger(__name__)
 
@@ -16,19 +16,95 @@ _FINISH_REASON_MAP = {
 
 
 class VLLMClient(RolloutBackendClient):
+    """Rollout backend client for vLLM.
+
+    Supports two modes:
+
+    1. **Direct mode** (default): sends requests directly to vLLM's
+       ``/v1/completions`` endpoint and parses the native vLLM response.
+    2. **Router mode** (``use_slime_router=True``): sends SGLang-format
+       requests to ``/generate`` through the SlimeRouter, which forwards
+       to the translation sidecar. The sidecar handles the vLLM translation
+       and returns SGLang-format responses.
+    """
+
     def __init__(self, args):
         self.args = args
         self._max_retries = getattr(args, "vllm_max_retries", 3)
+        self._use_router = getattr(args, "use_slime_router", False)
 
     @property
     def capabilities(self) -> BackendCapabilities:
         return BackendCapabilities(
-            supports_abort=False,
+            supports_abort=self._use_router,  # abort is supported through the sidecar
             supports_routed_experts=False,
             supports_prompt_logprobs=False,
         )
 
     async def generate(
+        self,
+        request: RolloutBackendRequest,
+        base_url: str,
+        headers: dict | None = None,
+    ) -> RolloutBackendResponse:
+        if self._use_router:
+            return await self._generate_via_router(request, base_url, headers)
+        return await self._generate_direct(request, base_url, headers)
+
+    # ------------------------------------------------------------------
+    # Router mode: SGLang-format /generate → sidecar → vLLM
+    # ------------------------------------------------------------------
+
+    async def _generate_via_router(
+        self,
+        request: RolloutBackendRequest,
+        base_url: str,
+        headers: dict | None = None,
+    ) -> RolloutBackendResponse:
+        """Send SGLang-format request through the SlimeRouter → sidecar pipeline."""
+
+        payload = {
+            "input_ids": request.input_ids,
+            "sampling_params": request.sampling_params,
+            "return_logprob": request.return_logprob,
+            "stream": False,
+        }
+        if request.image_data:
+            payload["image_data"] = request.image_data
+
+        url = f"{base_url.rstrip('/')}/generate"
+        output = await post(url, payload, headers=headers)
+
+        # Parse SGLang-format response (produced by translation sidecar)
+        meta = output.get("meta_info", {})
+        logprobs_data = meta.get("output_token_logprobs", [])
+
+        # output_token_logprobs is list of [logprob, token_id]
+        output_token_ids = [item[1] for item in logprobs_data] if logprobs_data else []
+        output_token_logprobs = [item[0] for item in logprobs_data] if logprobs_data else []
+
+        # Fall back to output_ids if logprobs not available
+        if not output_token_ids:
+            output_token_ids = output.get("output_ids", [])
+
+        finish_reason = meta.get("finish_reason", {}).get("type", "stop")
+
+        return RolloutBackendResponse(
+            text=output.get("text", ""),
+            output_token_ids=output_token_ids,
+            output_token_logprobs=output_token_logprobs,
+            finish_reason=finish_reason,
+            prompt_tokens=meta.get("prompt_tokens", len(request.input_ids)),
+            completion_tokens=len(output_token_ids),
+            backend_raw=output,
+            routed_experts=None,
+        )
+
+    # ------------------------------------------------------------------
+    # Direct mode: vLLM /v1/completions (no router)
+    # ------------------------------------------------------------------
+
+    async def _generate_direct(
         self,
         request: RolloutBackendRequest,
         base_url: str,
@@ -91,3 +167,15 @@ class VLLMClient(RolloutBackendClient):
             backend_raw=output,
             routed_experts=None,
         )
+
+    # ------------------------------------------------------------------
+    # Abort (router mode only)
+    # ------------------------------------------------------------------
+
+    async def abort(self) -> list[str]:
+        """Return worker URLs for abort. Only works in router mode."""
+        if not self._use_router:
+            return []
+        base = f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}"
+        r = await get(f"{base}/list_workers")
+        return r.get("urls", [])
