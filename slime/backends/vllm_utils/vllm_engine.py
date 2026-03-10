@@ -71,6 +71,8 @@ class VLLMEngine(RayActor):
             "--seed", str(seed),
             "--trust-remote-code",
         ]
+        gpu_mem_util = getattr(self.args, "vllm_gpu_memory_utilization", 0.4)
+        cmd.extend(["--gpu-memory-utilization", str(gpu_mem_util)])
         if getattr(self.args, "offload_rollout", False):
             cmd.append("--enable-sleep-mode")
         if getattr(self.args, "vllm_enforce_eager", True):

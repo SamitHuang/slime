@@ -264,6 +264,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Use vLLM packed weight transfer for non-colocate (default: True). Disable for per-bucket mode.",
             )
             parser.add_argument(
+                "--vllm-gpu-memory-utilization",
+                type=float,
+                default=0.4,
+                help="Fraction of GPU memory for vLLM KV cache (default: 0.85). "
+                     "Lower this if the training model leaves insufficient free memory.",
+            )
+            parser.add_argument(
                 "--rollout-function-path",
                 type=str,
                 default="slime.rollout.sglang_rollout.generate_rollout",
