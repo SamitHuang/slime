@@ -85,7 +85,7 @@ class VLLMClient(RolloutBackendClient):
 
         # Fall back to output_ids if logprobs not available
         if not output_token_ids:
-            output_token_ids = output.get("output_ids", [])
+            output_token_ids = output.get("output_ids") or []
 
         finish_reason = meta.get("finish_reason", {}).get("type", "stop")
 
