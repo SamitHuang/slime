@@ -95,7 +95,9 @@ def translate_generate_request(
     if body.get("return_logprob", False):
         vllm_payload["logprobs"] = 1
         # request token IDs alongside logprobs
-        vllm_payload["extra_body"] = {"return_token_ids": True}
+        # NOTE: must be a top-level param; "extra_body" is an OpenAI SDK
+        # client concept and is ignored by vLLM's raw HTTP API.
+        vllm_payload["return_token_ids"] = True
 
     return vllm_payload
 
@@ -113,7 +115,7 @@ def translate_vllm_response(
     output_ids: list[int] = choice.get("token_ids", [])
 
     # --- logprobs: zip(logprob, token_id) ---
-    output_token_logprobs: list[list[float | int]] | None = None
+    output_token_logprobs: list[list[float | int]] = []
     logprobs_obj = choice.get("logprobs")
     if logprobs_obj and output_ids:
         raw_lp: list[float | None] = logprobs_obj.get("token_logprobs", [])
@@ -127,16 +129,22 @@ def translate_vllm_response(
     mapped = _FINISH_REASON_MAP.get(raw_reason, raw_reason or "abort")
     finish_reason = {"type": mapped}
 
+    meta_info: dict[str, Any] = {
+        "finish_reason": finish_reason,
+        "weight_version": weight_version,
+        "prompt_tokens": usage.get("prompt_tokens", 0),
+        "completion_tokens": usage.get("completion_tokens", len(output_ids)),
+        "cached_tokens": 0,
+    }
+    # Only include output_token_logprobs when we have valid paired data;
+    # a None value causes RadixTreeMiddleware to silently fail when iterating.
+    if output_token_logprobs:
+        meta_info["output_token_logprobs"] = output_token_logprobs
+
     return {
         "text": choice.get("text", ""),
         "output_ids": output_ids,
-        "meta_info": {
-            "output_token_logprobs": output_token_logprobs,
-            "finish_reason": finish_reason,
-            "weight_version": weight_version,
-            "prompt_tokens": usage.get("prompt_tokens", 0),
-            "cached_tokens": 0,
-        },
+        "meta_info": meta_info,
     }
 
 
@@ -240,10 +248,10 @@ class TranslationSidecar:
                     "text": "",
                     "output_ids": [],
                     "meta_info": {
-                        "output_token_logprobs": None,
                         "finish_reason": {"type": "abort"},
                         "weight_version": self._weight_version,
                         "prompt_tokens": 0,
+                        "completion_tokens": 0,
                         "cached_tokens": 0,
                     },
                 },
@@ -256,10 +264,10 @@ class TranslationSidecar:
                     "text": "",
                     "output_ids": [],
                     "meta_info": {
-                        "output_token_logprobs": None,
                         "finish_reason": {"type": "abort"},
                         "weight_version": self._weight_version,
                         "prompt_tokens": 0,
+                        "completion_tokens": 0,
                         "cached_tokens": 0,
                     },
                 },
