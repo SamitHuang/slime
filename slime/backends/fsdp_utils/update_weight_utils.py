@@ -10,23 +10,31 @@ import torch.distributed as dist
 from ray.actor import ActorHandle
 from torch.distributed.tensor import DTensor, Replicate
 
-try:
-    from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions  # type: ignore[import]
-except ImportError:
-    from sglang.srt.patch_torch import monkey_patch_torch_reductions  # type: ignore[import]
-
-from sglang.srt.utils import MultiprocessingSerializer
-
 from slime.utils.distributed_utils import init_process_group
 
 
-try:
-    from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket  # type: ignore[import]
-except ImportError:
-    from sglang.srt.model_executor.model_runner import FlattenedTensorBucket  # type: ignore[import]
-
-
 logger = logging.getLogger(__name__)
+
+
+def _import_sglang_weight_sync_utils():
+    """Lazy-import SGLang serialization utilities.
+
+    Centralizes the try/except version fallbacks so callers get a clean tuple.
+    Raises ImportError if sglang is not installed at all.
+    """
+    try:
+        from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions  # type: ignore[import]
+    except ImportError:
+        from sglang.srt.patch_torch import monkey_patch_torch_reductions  # type: ignore[import]
+
+    from sglang.srt.utils import MultiprocessingSerializer
+
+    try:
+        from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket  # type: ignore[import]
+    except ImportError:
+        from sglang.srt.model_executor.model_runner import FlattenedTensorBucket  # type: ignore[import]
+
+    return monkey_patch_torch_reductions, MultiprocessingSerializer, FlattenedTensorBucket
 
 
 class UpdateWeight(abc.ABC):
@@ -134,6 +142,10 @@ class UpdateWeightFromTensor(UpdateWeight):
         # gather_object is only collective among group members, so we skip entirely.
         if self._ipc_gather_group is None:
             return
+
+        monkey_patch_torch_reductions, MultiprocessingSerializer, FlattenedTensorBucket = (
+            _import_sglang_weight_sync_utils()
+        )
 
         monkey_patch_torch_reductions()
         # Use flattened bucket approach similar to Megatron

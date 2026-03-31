@@ -13,9 +13,13 @@ import ray
 import torch
 import yaml
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
-from slime.backends.sglang_utils.sglang_engine import SGLangEngine
+# GPU memory-tag constants (originally from sglang.srt.constants).
+# Duplicated here to avoid a hard sglang dependency when running the vLLM backend.
+GPU_MEMORY_TYPE_KV_CACHE = "kv_cache"
+GPU_MEMORY_TYPE_WEIGHTS = "weights"
+GPU_MEMORY_TYPE_CUDA_GRAPH = "cuda_graph"
+
 from slime.backends.vllm_utils.vllm_engine import VLLMEngine
 from slime.rollout.base_types import call_rollout_fn
 from slime.utils import logging_utils
@@ -233,6 +237,8 @@ class EngineGroup:
         num_gpu_per_engine = min(self.num_gpus_per_engine, self.args.num_gpus_per_node)
 
         pg, reordered_bundle_indices, reordered_gpu_ids = self.pg
+
+        from slime.backends.sglang_utils.sglang_engine import SGLangEngine
 
         RolloutRayActor = ray.remote(SGLangEngine)
 
@@ -989,7 +995,7 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
         router_args.sglang_router_port = router_port
 
     else:
-        from sglang_router.launch_router import RouterArgs
+        from sglang_router.launch_router import RouterArgs  # noqa: delayed import — only needed for sglang router
 
         from slime.utils.http_utils import run_router
 
