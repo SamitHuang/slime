@@ -268,6 +268,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                      "Lower this if the training model leaves insufficient free memory.",
             )
             parser.add_argument(
+                "--server-concurrency",
+                type=int,
+                default=512,
+                help="Maximum number of concurrent requests sent to the rollout server. "
+                     "Controls request parallelism for any backend (sglang or vllm).",
+            )
+            parser.add_argument(
                 "--rollout-function-path",
                 type=str,
                 default="slime.rollout.sglang_rollout.generate_rollout",
