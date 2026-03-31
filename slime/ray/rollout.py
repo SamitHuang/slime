@@ -973,14 +973,14 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
     ``force_new`` is False, skip launching and return the existing values.
     When ``force_new`` is True (multi-model), always allocate a fresh port.
     """
-    if not force_new and args.sglang_router_ip is not None:
+    if not force_new and getattr(args, "sglang_router_ip", None) is not None:
         return args.sglang_router_ip, args.sglang_router_port
 
     router_ip = _wrap_ipv6(get_host_info()[1])
     if force_new:
         router_port = find_available_port(random.randint(3000, 4000))
     else:
-        router_port = args.sglang_router_port
+        router_port = getattr(args, "sglang_router_port", None)
         if router_port is None:
             router_port = find_available_port(random.randint(3000, 4000))
 
