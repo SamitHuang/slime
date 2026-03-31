@@ -204,7 +204,8 @@ def init_http_client(args):
     if not args.rollout_num_gpus:
         return
 
-    _client_concurrency = args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+    server_concurrency = getattr(args, "sglang_server_concurrency", 256)
+    _client_concurrency = server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
     if _http_client is None:
         _http_client = httpx.AsyncClient(
             limits=httpx.Limits(max_connections=_client_concurrency),
