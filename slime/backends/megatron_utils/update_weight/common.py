@@ -15,31 +15,33 @@ from slime.utils.types import ParamInfo
 def _cat_partitions(
     partitions: list[torch.Tensor], partition_dim: int, stride: int
 ) -> torch.Tensor:
-    """Concatenate TP-gathered partitions, handling interleaved (stride > 1) layouts.
+    """Concatenate TP-gathered partitions, reversing Megatron-Core's strided layout.
 
     When ``stride == 1`` each rank holds a single contiguous shard and a plain
     ``torch.cat`` along *partition_dim* is sufficient.
 
-    When ``stride > 1`` (e.g. Megatron-Core GroupedMLP expert weights) each
-    rank's shard contains multiple interleaved groups of ``stride`` consecutive
-    elements.  We split each shard into those groups and interleave across
-    ranks to reconstruct the original full tensor.
+    When ``stride > 1``, Megatron-Core's ``_initialize_affine_weight_cpu``
+    splits the master weight into ``world_size * stride`` equal sub-chunks and
+    assigns rank *r* the sub-chunks at indices ``r, r + world_size,
+    r + 2 * world_size, …`` (i.e. ``weight_list[rank::world_size]``).  Each
+    rank therefore holds ``stride`` sub-chunks concatenated together.
+
+    To reconstruct the original full tensor we split each rank's shard back
+    into ``stride`` sub-chunks and interleave them:
+    ``for i in range(stride): for r in range(world_size): append chunk[r][i]``
     """
     if stride == 1:
         return torch.cat(partitions, dim=partition_dim)
 
-    # Number of contiguous groups stored on each rank
-    num_groups = partitions[0].shape[partition_dim] // stride
-    if num_groups <= 0:
-        # Fallback: stride >= shard size — simple concat should still be correct
-        return torch.cat(partitions, dim=partition_dim)
-
-    rank_groups = [p.chunk(num_groups, dim=partition_dim) for p in partitions]
-    interleaved: list[torch.Tensor] = []
-    for g in range(num_groups):
-        for r in range(len(partitions)):
-            interleaved.append(rank_groups[r][g])
-    return torch.cat(interleaved, dim=partition_dim)
+    world_size = len(partitions)
+    # Each rank holds exactly `stride` sub-chunks concatenated along partition_dim.
+    rank_chunks = [p.chunk(stride, dim=partition_dim) for p in partitions]
+    # Reconstruct original ordering: chunk index (i * world_size + r)
+    ordered: list[torch.Tensor] = []
+    for i in range(stride):
+        for r in range(world_size):
+            ordered.append(rank_chunks[r][i])
+    return torch.cat(ordered, dim=partition_dim)
 
 
 def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
