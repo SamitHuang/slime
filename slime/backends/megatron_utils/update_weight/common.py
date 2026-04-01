@@ -12,6 +12,36 @@ from slime.backends.megatron_utils.misc_utils import strip_param_name_prefix
 from slime.utils.types import ParamInfo
 
 
+def _cat_partitions(
+    partitions: list[torch.Tensor], partition_dim: int, stride: int
+) -> torch.Tensor:
+    """Concatenate TP-gathered partitions, handling interleaved (stride > 1) layouts.
+
+    When ``stride == 1`` each rank holds a single contiguous shard and a plain
+    ``torch.cat`` along *partition_dim* is sufficient.
+
+    When ``stride > 1`` (e.g. Megatron-Core GroupedMLP expert weights) each
+    rank's shard contains multiple interleaved groups of ``stride`` consecutive
+    elements.  We split each shard into those groups and interleave across
+    ranks to reconstruct the original full tensor.
+    """
+    if stride == 1:
+        return torch.cat(partitions, dim=partition_dim)
+
+    # Number of contiguous groups stored on each rank
+    num_groups = partitions[0].shape[partition_dim] // stride
+    if num_groups <= 0:
+        # Fallback: stride >= shard size — simple concat should still be correct
+        return torch.cat(partitions, dim=partition_dim)
+
+    rank_groups = [p.chunk(num_groups, dim=partition_dim) for p in partitions]
+    interleaved: list[torch.Tensor] = []
+    for g in range(num_groups):
+        for r in range(len(partitions)):
+            interleaved.append(rank_groups[r][g])
+    return torch.cat(interleaved, dim=partition_dim)
+
+
 def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
     """
     All-gather TP-sharded param to full tensor. expert_bias→param, non-TP/duplicated→param.data.
@@ -34,7 +64,7 @@ def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
     param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
     dist.all_gather(param_partitions, param.data, group=tp_group)
     partition_dim = param.partition_dim
-    assert param.partition_stride == 1, "partition_stride != 1 is not supported"
+    stride = getattr(param, "partition_stride", 1)
     # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
     # TODO: check only GLU is used.
     if "linear_fc1.weight" in name:
@@ -44,7 +74,7 @@ def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
     if "linear_fc2.weight" in name:
         if partition_dim == 0:
             partition_dim = 1
-    param = torch.cat(param_partitions, dim=partition_dim)
+    param = _cat_partitions(param_partitions, partition_dim, stride)
     return param
 
 
@@ -63,10 +93,10 @@ def all_gather_params_async(
     for info, param in param_infos_and_params:
         # Prepare async all_gather
         if "expert_bias" in info.name:
-            gather_tasks.append((info, param, None, None, None))
+            gather_tasks.append((info, param, None, None, None, 1))
             handles.append(None)
         elif not param.tensor_model_parallel or getattr(param, "parallel_mode", None) == "duplicated":
-            gather_tasks.append((info, param.data, None, None, None))
+            gather_tasks.append((info, param.data, None, None, None, 1))
             handles.append(None)
         else:
             # Start async all_gather
@@ -79,7 +109,8 @@ def all_gather_params_async(
 
             param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
             handle = dist.all_gather(param_partitions, param.data, group=tp_group, async_op=True)
-            gather_tasks.append((info, None, handle, param_partitions, param.partition_dim))
+            partition_stride = getattr(param, "partition_stride", 1)
+            gather_tasks.append((info, None, handle, param_partitions, param.partition_dim, partition_stride))
             handles.append(handle)
 
     # Phase 2: Wait for ALL async operations to complete at once
@@ -90,13 +121,12 @@ def all_gather_params_async(
 
     # Phase 3: Process all results after all communications are done
     gathered_params = []
-    for info, direct_param, handle, param_partitions, partition_dim in gather_tasks:
+    for info, direct_param, handle, param_partitions, partition_dim, partition_stride in gather_tasks:
         if handle is None:
             # No all_gather needed
             param = direct_param
         else:
             # Process the gathered partitions (same logic as original all_gather_param)
-            assert partition_dim is not None, "partition_stride != 1 is not supported"
             # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
             # TODO: check only GLU is used.
             if "linear_fc1.weight" in info.name:
@@ -106,7 +136,7 @@ def all_gather_params_async(
             if "linear_fc2.weight" in info.name:
                 if partition_dim == 0:
                     partition_dim = 1
-            param = torch.cat(param_partitions, dim=partition_dim)
+            param = _cat_partitions(param_partitions, partition_dim, partition_stride)
 
         gathered_params.append(param)
 
