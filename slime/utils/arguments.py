@@ -1507,7 +1507,7 @@ def parse_args(add_custom_arguments=None):
 
         args = megatron_parse_args(
             extra_args_provider=add_slime_arguments,
-            skip_hf_validate=True, #pre.debug_rollout_only,
+            skip_hf_validate=pre.debug_rollout_only,
         )
     else:
         logger.warning(
