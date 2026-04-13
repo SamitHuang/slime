@@ -20,7 +20,6 @@ GPU_MEMORY_TYPE_KV_CACHE = "kv_cache"
 GPU_MEMORY_TYPE_WEIGHTS = "weights"
 GPU_MEMORY_TYPE_CUDA_GRAPH = "cuda_graph"
 
-from slime.backends.vllm_utils.vllm_engine import VLLMEngine
 from slime.rollout.base_types import call_rollout_fn
 from slime.utils import logging_utils
 from slime.utils.health_monitor import RolloutHealthMonitor
@@ -238,9 +237,14 @@ class EngineGroup:
 
         pg, reordered_bundle_indices, reordered_gpu_ids = self.pg
 
-        from slime.backends.sglang_utils.sglang_engine import SGLangEngine
+        if getattr(self.args, "rollout_backend", "sglang") == "vllm":
+            from slime.backends.vllm_utils.vllm_engine import VLLMEngine
 
-        RolloutRayActor = ray.remote(SGLangEngine)
+            RolloutRayActor = ray.remote(VLLMEngine)
+        else:
+            from slime.backends.sglang_utils.sglang_engine import SGLangEngine
+
+            RolloutRayActor = ray.remote(SGLangEngine)
 
         rollout_engines = []
         for i in range(len(self.all_engines)):
@@ -1051,6 +1055,9 @@ def _start_vllm_rollout_servers(args, pg) -> dict[str, RolloutServer]:
         router_port = None
 
     env_vars = {name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST}
+
+    from slime.backends.vllm_utils.vllm_engine import VLLMEngine
+
     VLLMRayActor = ray.remote(VLLMEngine)
 
     engines = []

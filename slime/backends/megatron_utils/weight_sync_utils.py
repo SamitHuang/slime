@@ -120,8 +120,7 @@ class SafeUnpickler(pickle.Unpickler):
     """
 
     ALLOWED_MODULE_PREFIXES = {
-        # Python builtins
-        "builtins.",
+        # Python builtins (specific safe classes only – see ALLOW_CLASSES)
         "collections.",
         "copyreg.",
         "functools.",
@@ -161,10 +160,47 @@ class SafeUnpickler(pickle.Unpickler):
         "torch_npu.",
     }
 
+    # Specific builtins classes that are safe to unpickle.
+    ALLOW_CLASSES = {
+        ("builtins", "True"),
+        ("builtins", "False"),
+        ("builtins", "None"),
+        ("builtins", "dict"),
+        ("builtins", "list"),
+        ("builtins", "tuple"),
+        ("builtins", "set"),
+        ("builtins", "frozenset"),
+        ("builtins", "int"),
+        ("builtins", "float"),
+        ("builtins", "complex"),
+        ("builtins", "str"),
+        ("builtins", "bytes"),
+        ("builtins", "bytearray"),
+        ("builtins", "bool"),
+        ("builtins", "slice"),
+        ("builtins", "range"),
+        ("builtins", "enumerate"),
+        ("builtins", "map"),
+        ("builtins", "zip"),
+        ("builtins", "filter"),
+        ("builtins", "reversed"),
+        ("builtins", "sorted"),
+    }
+
     DENY_CLASSES = {
         ("builtins", "eval"),
         ("builtins", "exec"),
         ("builtins", "compile"),
+        ("builtins", "getattr"),
+        ("builtins", "setattr"),
+        ("builtins", "delattr"),
+        ("builtins", "__import__"),
+        ("builtins", "globals"),
+        ("builtins", "locals"),
+        ("builtins", "open"),
+        ("builtins", "breakpoint"),
+        ("builtins", "input"),
+        ("builtins", "memoryview"),
         ("os", "system"),
         ("subprocess", "Popen"),
         ("subprocess", "run"),
@@ -175,6 +211,14 @@ class SafeUnpickler(pickle.Unpickler):
 
     def find_class(self, module: str, name: str):
         if (module, name) in self.DENY_CLASSES:
+            raise RuntimeError(
+                f"Blocked unsafe class loading ({module}.{name}), "
+                f"to prevent exploitation of CVE-2025-10164"
+            )
+        # Check explicit allow-list for builtins (strict whitelist)
+        if module == "builtins":
+            if (module, name) in self.ALLOW_CLASSES:
+                return super().find_class(module, name)
             raise RuntimeError(
                 f"Blocked unsafe class loading ({module}.{name}), "
                 f"to prevent exploitation of CVE-2025-10164"
