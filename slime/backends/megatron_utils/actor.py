@@ -36,6 +36,7 @@ from .model import forward_only, initialize_model_and_optimizer, save, train
 from .update_weight.common import named_params_and_buffers
 from .update_weight.update_weight_from_distributed import UpdateWeightFromDistributed
 from .update_weight.update_weight_from_tensor import UpdateWeightFromTensor
+from .update_weight.update_weight_from_tensor_vllm import UpdateVLLMWeightFromTensor
 
 logging.getLogger("megatron").setLevel(logging.WARNING)
 
@@ -128,8 +129,14 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.vocab_size is None:
             self.args.vocab_size = self.tokenizer.vocab_size
 
+        use_vllm_colocate = self.args.colocate and getattr(self.args, "rollout_backend", "sglang") == "vllm"
         use_tensor_update = self.args.colocate and getattr(self.args, "rollout_backend", "sglang") != "vllm"
-        update_weight_cls = UpdateWeightFromTensor if use_tensor_update else UpdateWeightFromDistributed
+        if use_vllm_colocate:
+            update_weight_cls = UpdateVLLMWeightFromTensor
+        elif use_tensor_update:
+            update_weight_cls = UpdateWeightFromTensor
+        else:
+            update_weight_cls = UpdateWeightFromDistributed
         self.weight_updater = update_weight_cls(
             self.args,
             self.model,

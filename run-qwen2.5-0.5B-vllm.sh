@@ -97,6 +97,8 @@ VLLM_ARGS=(
    --rollout-server-concurrency 512
    --use-slime-router
    --slime-router-middleware-paths slime.router.middleware_hub.radix_tree_middleware.RadixTreeMiddleware
+   # Uncomment below to enable colocate mode (IPC weight transfer, same GPU)
+   --colocate
 )
 
 MISC_ARGS=(
