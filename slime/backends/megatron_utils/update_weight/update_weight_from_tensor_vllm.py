@@ -167,6 +167,7 @@ class UpdateVLLMWeightFromTensor:
 
         Pause → flush → init IPC (once) → send weights via IPC → resume.
         """
+
         self.weight_version += 1
         rank = dist.get_rank()
 

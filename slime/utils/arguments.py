@@ -1762,7 +1762,7 @@ def slime_validate_args(args):
         args.offload_train = False
     if args.offload_rollout is None:
         args.offload_rollout = False
-
+    args.offload_rollout = False 
     if args.eval_function_path is None:
         args.eval_function_path = args.rollout_function_path
 
