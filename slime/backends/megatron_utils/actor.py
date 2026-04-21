@@ -10,8 +10,16 @@ import torch
 import torch.distributed as dist
 from megatron.core import mpu
 from ray.actor import ActorHandle
-from torch_memory_saver import torch_memory_saver
 from transformers import AutoConfig, AutoTokenizer
+
+# torch_memory_saver is only used when the rollout backend is sglang (the
+# default). For the vLLM rollout backend we intentionally avoid importing it
+# (the preload .so is not loaded), so we resolve it lazily and tolerate the
+# import being unavailable.
+try:  # pragma: no cover - import guard
+    from torch_memory_saver import torch_memory_saver  # type: ignore
+except Exception:  # noqa: BLE001 - missing native lib should not crash import
+    torch_memory_saver = None  # type: ignore[assignment]
 
 from slime.ray.train_actor import TrainRayActor
 from slime.utils import train_dump_utils
@@ -79,9 +87,15 @@ class MegatronTrainRayActor(TrainRayActor):
         dist.barrier(group=get_gloo_group())
 
         if args.offload_train:
-            if (x := args.train_memory_margin_bytes) > 0:
-                logger.info(f"Set torch_memory_saver.memory_margin_bytes to {x}")
-                torch_memory_saver.memory_margin_bytes = x
+            if self._uses_torch_memory_saver():
+                if (x := args.train_memory_margin_bytes) > 0:
+                    logger.info(f"Set torch_memory_saver.memory_margin_bytes to {x}")
+                    torch_memory_saver.memory_margin_bytes = x
+            else:
+                logger.info(
+                    "offload_train enabled with rollout_backend=vllm: using CPU offload "
+                    "instead of torch_memory_saver."
+                )
 
         if role == "critic":
             self.args.load = self.args.critic_load
@@ -165,6 +179,59 @@ class MegatronTrainRayActor(TrainRayActor):
 
         return start_rollout_id
 
+    def _uses_torch_memory_saver(self) -> bool:
+        """Whether GPU memory should be released via torch_memory_saver.
+
+        torch_memory_saver relies on an LD_PRELOAD-injected allocator hook that
+        is only set up for the sglang rollout backend (see ``RayTrainGroup``).
+        For the vLLM rollout backend we fall back to an explicit CPU-offload
+        path that moves model parameters and optimizer state to CPU.
+        """
+        if not self.args.offload_train:
+            return False
+        if torch_memory_saver is None:
+            return False
+        return getattr(self.args, "rollout_backend", "sglang") != "vllm"
+
+    @torch.no_grad()
+    def _move_optimizer_state_to_device(self, device: str | torch.device) -> None:
+        """Move all tensor entries in ``self.optimizer.state`` to ``device``.
+
+        Mirrors the helper used by the FSDP backend; works for any optimizer
+        that exposes the standard ``param_groups`` / ``state`` interface,
+        including Megatron's DistributedOptimizer.
+        """
+        optimizer = self.optimizer
+        if optimizer is None or not getattr(optimizer, "state", None):
+            return
+        for param_group in optimizer.param_groups:
+            for param in param_group["params"]:
+                state = optimizer.state.get(param, None)
+                if not state:
+                    continue
+                for key, value in state.items():
+                    if isinstance(value, torch.Tensor):
+                        state[key] = value.to(device, non_blocking=True)
+        torch.cuda.synchronize()
+
+    def _cpu_offload_sleep(self) -> None:
+        """CPU-offload alternative to ``torch_memory_saver.pause()`` for vLLM."""
+        if self.model is not None:
+            for module in self.model:
+                module.to("cpu", non_blocking=True)
+        if getattr(self, "optimizer", None) is not None:
+            self._move_optimizer_state_to_device("cpu")
+
+    def _cpu_offload_wake_up(self) -> None:
+        """CPU-offload counterpart to ``_cpu_offload_sleep``."""
+        device = torch.cuda.current_device()
+        if self.model is not None:
+            for module in self.model:
+                module.to(device, non_blocking=True)
+        if getattr(self, "optimizer", None) is not None:
+            self._move_optimizer_state_to_device(device)
+        torch.cuda.synchronize()
+
     @timer
     def sleep(self) -> None:
         assert self.args.offload_train
@@ -173,7 +240,11 @@ class MegatronTrainRayActor(TrainRayActor):
         print_memory("before offload model")
         destroy_process_groups()
 
-        torch_memory_saver.pause()
+        if self._uses_torch_memory_saver():
+            torch_memory_saver.pause()
+        else:
+            self._cpu_offload_sleep()
+            clear_memory()
 
         print_memory("after offload model")
 
@@ -182,7 +253,10 @@ class MegatronTrainRayActor(TrainRayActor):
         assert self.args.offload_train
         print_memory("before wake_up model")
 
-        torch_memory_saver.resume()
+        if self._uses_torch_memory_saver():
+            torch_memory_saver.resume()
+        else:
+            self._cpu_offload_wake_up()
 
         clear_memory()
         reload_process_groups()
