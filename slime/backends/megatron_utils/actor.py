@@ -197,21 +197,29 @@ class MegatronTrainRayActor(TrainRayActor):
     def _move_optimizer_state_to_device(self, device: str | torch.device) -> None:
         """Move all tensor entries in ``self.optimizer.state`` to ``device``.
 
-        Mirrors the helper used by the FSDP backend; works for any optimizer
-        that exposes the standard ``param_groups`` / ``state`` interface,
-        including Megatron's DistributedOptimizer.
+        Handles both the standard ``dict[param, state_dict]`` layout used by
+        stock torch optimizers and the ``ProxyDict`` layout used by Megatron's
+        ``DistributedOptimizer``, whose ``items()`` yields
+        ``((idx, inner_key), tensor)`` pairs directly (and which has no
+        ``.get()`` method).
         """
         optimizer = self.optimizer
-        if optimizer is None or not getattr(optimizer, "state", None):
+        if optimizer is None:
             return
-        for param_group in optimizer.param_groups:
-            for param in param_group["params"]:
-                state = optimizer.state.get(param, None)
-                if not state:
-                    continue
-                for key, value in state.items():
-                    if isinstance(value, torch.Tensor):
-                        state[key] = value.to(device, non_blocking=True)
+        state = getattr(optimizer, "state", None)
+        if not state:
+            return
+
+        # Snapshot items first so we can safely reassign via __setitem__.
+        for key, value in list(state.items()):
+            if isinstance(value, torch.Tensor):
+                # Megatron ProxyDict: value is the tensor itself.
+                state[key] = value.to(device, non_blocking=True)
+            elif isinstance(value, dict):
+                # Standard torch optimizer: value is a per-param state dict.
+                for sub_key, sub_value in value.items():
+                    if isinstance(sub_value, torch.Tensor):
+                        value[sub_key] = sub_value.to(device, non_blocking=True)
         torch.cuda.synchronize()
 
     def _cpu_offload_sleep(self) -> None:
