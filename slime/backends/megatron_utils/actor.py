@@ -222,20 +222,40 @@ class MegatronTrainRayActor(TrainRayActor):
                         value[sub_key] = sub_value.to(device, non_blocking=True)
         torch.cuda.synchronize()
 
+    @torch.no_grad()
+    def _move_module_tensors_to_device(self, device: str | torch.device) -> None:
+        """Move params/grads/buffers to ``device`` in-place.
+
+        ``nn.Module.to()`` replaces ``nn.Parameter`` objects whenever the
+        device actually changes, which silently breaks any external references
+        the optimizer (or our ``weights_backuper``) still holds to the old
+        tensors -- gradients then accumulate on GPU tensors that the optimizer
+        no longer knows about, so ``optimizer.step()`` becomes a no-op on the
+        live parameters. Mutating ``p.data`` (and ``p.grad.data``) in place
+        keeps the ``Parameter`` identity intact, so every consumer continues
+        to see the moved storage.
+        """
+        if self.model is None:
+            return
+        for module in self.model:
+            for p in module.parameters(recurse=True):
+                p.data = p.data.to(device, non_blocking=True)
+                if p.grad is not None:
+                    p.grad.data = p.grad.data.to(device, non_blocking=True)
+            for b in module.buffers(recurse=True):
+                b.data = b.data.to(device, non_blocking=True)
+
     def _cpu_offload_sleep(self) -> None:
         """CPU-offload alternative to ``torch_memory_saver.pause()`` for vLLM."""
-        if self.model is not None:
-            for module in self.model:
-                module.to("cpu", non_blocking=True)
+        self._move_module_tensors_to_device("cpu")
         if getattr(self, "optimizer", None) is not None:
             self._move_optimizer_state_to_device("cpu")
+        torch.cuda.synchronize()
 
     def _cpu_offload_wake_up(self) -> None:
         """CPU-offload counterpart to ``_cpu_offload_sleep``."""
         device = torch.cuda.current_device()
-        if self.model is not None:
-            for module in self.model:
-                module.to(device, non_blocking=True)
+        self._move_module_tensors_to_device(device)
         if getattr(self, "optimizer", None) is not None:
             self._move_optimizer_state_to_device(device)
         torch.cuda.synchronize()
@@ -646,7 +666,9 @@ class MegatronTrainRayActor(TrainRayActor):
             if dist.get_rank() == 0:
                 ray.get(self.rollout_manager.clear_num_new_engines.remote())
 
-        with nullcontext(): #torch_memory_saver.disable() if self.args.offload_train else nullcontext():
+        weight_update_ctx = torch_memory_saver.disable() if self._uses_torch_memory_saver() else nullcontext()
+
+        with weight_update_ctx:
             print_memory("before update_weights")
             self.weight_updater.update_weights()
             print_memory("after update_weights")
