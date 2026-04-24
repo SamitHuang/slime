@@ -283,7 +283,9 @@ class MegatronTrainRayActor(TrainRayActor):
                 _move_tensor_attr(p, "main_grad")
 
             # 3) Registered buffers (e.g. RoPE caches, norm running stats).
-            for b in module.buffers(recurse=True):
+            #    Use the unbound ``nn.Module.buffers`` because Megatron's DDP
+            #    shadows the method with a ``list`` of ParamAndGradBuffer.
+            for b in torch.nn.Module.buffers(module, recurse=True):
                 b.data = b.data.to(device, non_blocking=True)
 
     def _cpu_offload_sleep(self) -> None:
