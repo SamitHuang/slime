@@ -195,31 +195,39 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @torch.no_grad()
     def _move_optimizer_state_to_device(self, device: str | torch.device) -> None:
-        """Move all tensor entries in ``self.optimizer.state`` to ``device``.
+        """Move all tensor entries in optimizer state to ``device``.
 
-        Handles both the standard ``dict[param, state_dict]`` layout used by
-        stock torch optimizers and the ``ProxyDict`` layout used by Megatron's
-        ``DistributedOptimizer``, whose ``items()`` yields
-        ``((idx, inner_key), tensor)`` pairs directly (and which has no
-        ``.get()`` method).
+        Handles three layouts we see in practice:
+          * ``ChainedOptimizer`` used when there are multiple model chunks
+            (virtual pipeline) -- we must recurse into ``chained_optimizers``
+            because the outer object's ``.state`` is empty.
+          * Megatron ``DistributedOptimizer`` whose ``state`` is a ``ProxyDict``
+            that yields ``(key, tensor)`` directly (no ``.get``).
+          * Stock torch optimizer with ``dict[param, state_dict]`` layout.
         """
-        optimizer = self.optimizer
-        if optimizer is None:
-            return
-        state = getattr(optimizer, "state", None)
-        if not state:
+        if self.optimizer is None:
             return
 
-        # Snapshot items first so we can safely reassign via __setitem__.
-        for key, value in list(state.items()):
-            if isinstance(value, torch.Tensor):
-                # Megatron ProxyDict: value is the tensor itself.
-                state[key] = value.to(device, non_blocking=True)
-            elif isinstance(value, dict):
-                # Standard torch optimizer: value is a per-param state dict.
-                for sub_key, sub_value in value.items():
-                    if isinstance(sub_value, torch.Tensor):
-                        value[sub_key] = sub_value.to(device, non_blocking=True)
+        def _walk(opt) -> None:
+            # ChainedOptimizer (Megatron VP): dispatch to inner optimizers.
+            inner = getattr(opt, "chained_optimizers", None)
+            if inner:
+                for sub in inner:
+                    _walk(sub)
+                return
+
+            state = getattr(opt, "state", None)
+            if not state:
+                return
+            for key, value in list(state.items()):
+                if isinstance(value, torch.Tensor):
+                    state[key] = value.to(device, non_blocking=True)
+                elif isinstance(value, dict):
+                    for sub_key, sub_value in value.items():
+                        if isinstance(sub_value, torch.Tensor):
+                            value[sub_key] = sub_value.to(device, non_blocking=True)
+
+        _walk(self.optimizer)
         torch.cuda.synchronize()
 
     @torch.no_grad()
@@ -234,14 +242,47 @@ class MegatronTrainRayActor(TrainRayActor):
         live parameters. Mutating ``p.data`` (and ``p.grad.data``) in place
         keeps the ``Parameter`` identity intact, so every consumer continues
         to see the moved storage.
+
+        Additional Megatron specifics handled here:
+          * ``p.main_grad`` (used with gradient-accumulation fusion / DDP) is
+            moved alongside ``p.grad``; the optimizer reads from
+            ``main_grad`` when present.
+          * Megatron ``DistributedDataParallel`` stores parameters/grads in a
+            few big contiguous ``ParamAndGradBuffer`` tensors; individual
+            ``p.data`` / ``p.main_grad`` are views into them. Moving only the
+            views leaves the big buckets allocated on GPU and leaves the
+            views pointing at stale storage, so we also migrate each
+            buffer's underlying ``param_data`` / ``grad_data`` in place.
         """
         if self.model is None:
             return
+
+        def _move_tensor_attr(owner, attr: str) -> None:
+            t = getattr(owner, attr, None)
+            if isinstance(t, torch.Tensor):
+                t.data = t.data.to(device, non_blocking=True)
+
         for module in self.model:
+            # 1) Move DDP bucket buffers first so subsequent param views land
+            #    on the new device's storage without orphaning the buckets.
+            for bucket_attr in ("buffers", "expert_parallel_buffers"):
+                bucket_list = getattr(module, bucket_attr, None)
+                # ``buffers`` on nn.Module is a *method*; only treat it as our
+                # target when it is the Megatron list of ParamAndGradBuffer.
+                if isinstance(bucket_list, (list, tuple)):
+                    for buf in bucket_list:
+                        for t_attr in ("param_data", "grad_data"):
+                            _move_tensor_attr(buf, t_attr)
+
+            # 2) Move parameter / grad views in place (Parameter identity
+            #    preserved so optimizer + weights_backuper stay consistent).
             for p in module.parameters(recurse=True):
                 p.data = p.data.to(device, non_blocking=True)
                 if p.grad is not None:
                     p.grad.data = p.grad.data.to(device, non_blocking=True)
+                _move_tensor_attr(p, "main_grad")
+
+            # 3) Registered buffers (e.g. RoPE caches, norm running stats).
             for b in module.buffers(recurse=True):
                 b.data = b.data.to(device, non_blocking=True)
 
