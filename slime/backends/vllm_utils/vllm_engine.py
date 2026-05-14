@@ -97,11 +97,10 @@ class VLLMEngine(RayActor):
         env["NCCL_P2P_DISABLE"] = "1"
         env.setdefault("NCCL_IB_DISABLE", "1")
 
-        # self._log_file = tempfile.NamedTemporaryFile(
-        #     prefix="vllm_engine_", suffix=".log", delete=False, mode="w"
-        # )
-        log_path = "/data/n0090/SLIME_PJ/new_version/slime/vllm_server_log.log"
-        self._log_file = open(log_path,"w")
+        self._log_file = tempfile.NamedTemporaryFile(
+            prefix="vllm_engine_", suffix=".log", delete=False, mode="w"
+        )
+        
         logger.info("Launching vLLM: cmd=%s, CUDA_VISIBLE_DEVICES=%s, log=%s",
                      " ".join(cmd), dev_str, self._log_file.name)
         self.process = subprocess.Popen(
