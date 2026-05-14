@@ -457,6 +457,7 @@ class RolloutManager:
 
         self.pg = pg
         self.args = args
+        self.rollout_backend = getattr(args, "rollout_backend", "sglang")
 
         init_tracking(args, primary=False)
 
@@ -589,9 +590,21 @@ class RolloutManager:
             srv.onload(tags)
 
     def onload_weights(self):
-        self.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+        # vLLM does not expose a separate weights-only resume: a single
+        # resume_memory_occupation reloads both weights and KV cache.  To keep
+        # the public ``onload_weights`` / ``onload_kv`` contract on the train
+        # side unchanged, we load everything here and make ``onload_kv`` a
+        # no-op for the vLLM backend.
+        if self.rollout_backend == "vllm":
+            self.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE])
+        else:
+            self.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS])
 
     def onload_kv(self):
+        # See ``onload_weights``: for vLLM, weights+KV are already resumed
+        # together, so this is a no-op to avoid a double-resume.
+        if self.rollout_backend == "vllm":
+            return
         self.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
 
     def recover_rollout_engines(self, model_name: str | None = None):

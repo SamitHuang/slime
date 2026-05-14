@@ -32,6 +32,7 @@ class VLLMEngine(RayActor):
         self._log_file = None
         self._sidecar_log_file = None
         self._weight_version: int = 0
+        self._colocate: bool = getattr(args, "colocate", False)
 
     @property
     def sidecar_url(self) -> str:
@@ -62,16 +63,22 @@ class VLLMEngine(RayActor):
             dev_str = ",".join(str(g) for g in gpu_ids)
 
         seed = getattr(self.args, "seed", 1234) + self.rank
+        # Use IPC backend when colocated (same GPU), NCCL otherwise
+        if self._colocate:
+            weight_transfer_backend = '{"backend": "ipc"}'
+        else:
+            weight_transfer_backend = '{"backend": "nccl"}'
+
         cmd = [
             "vllm", "serve", model,
             "--tensor-parallel-size", str(tp),
             "--port", str(self.server_port),
             "--host", "0.0.0.0",
-            "--weight-transfer-config", '{"backend": "nccl"}',
+            "--weight-transfer-config", weight_transfer_backend,
             "--seed", str(seed),
             "--trust-remote-code",
         ]
-        gpu_mem_util = getattr(self.args, "vllm_gpu_memory_utilization", 0.4)
+        gpu_mem_util = getattr(self.args, "vllm_gpu_memory_utilization", 0.25)
         cmd.extend(["--gpu-memory-utilization", str(gpu_mem_util)])
         if getattr(self.args, "offload_rollout", False):
             cmd.append("--enable-sleep-mode")
@@ -82,6 +89,8 @@ class VLLMEngine(RayActor):
 
         env = os.environ.copy()
         env["VLLM_SERVER_DEV_MODE"] = "1"
+        if self._colocate:
+            env["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
         env["CUDA_VISIBLE_DEVICES"] = dev_str
         env.setdefault("NCCL_DEBUG", "INFO")
         env.setdefault("NCCL_DEBUG_SUBSYS", "ALL")
@@ -91,6 +100,7 @@ class VLLMEngine(RayActor):
         self._log_file = tempfile.NamedTemporaryFile(
             prefix="vllm_engine_", suffix=".log", delete=False, mode="w"
         )
+        
         logger.info("Launching vLLM: cmd=%s, CUDA_VISIBLE_DEVICES=%s, log=%s",
                      " ".join(cmd), dev_str, self._log_file.name)
         self.process = subprocess.Popen(
@@ -320,6 +330,15 @@ class VLLMEngine(RayActor):
             except Exception:
                 pass
         return self._weight_version
+
+    def get_vllm_url(self) -> str:
+        """Return the raw vLLM server URL (used by IPC weight transfer)."""
+        return self.vllm_url
+
+    def set_weight_version(self, version: int) -> None:
+        """Set weight version on both the engine and the sidecar."""
+        self._weight_version = version
+        self._bump_weight_version(version)
 
     def check_weights(self, action: str):
         pass

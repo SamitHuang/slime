@@ -65,7 +65,30 @@ class RayTrainGroup:
             **self.args.train_env_vars,
         }
 
-        if self.args.offload_train and self.args.train_backend == "megatron":
+        # if self.args.offload_train and self.args.train_backend == "megatron":
+        #     import torch_memory_saver
+
+        #     dynlib_path = os.path.join(
+        #         os.path.dirname(os.path.dirname(torch_memory_saver.__file__)),
+        #         "torch_memory_saver_hook_mode_preload.abi3.so",
+        #     )
+        #     assert os.path.exists(dynlib_path), f"LD_PRELOAD so file {dynlib_path} does not exist."
+
+        #     env_vars["LD_PRELOAD"] = dynlib_path
+        #     env_vars["TMS_INIT_ENABLE"] = "1"
+        #     env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
+
+        # torch_memory_saver requires an LD_PRELOAD'd allocator hook. It is only
+        # used when offloading the trainer for the sglang rollout backend. With
+        # the vLLM rollout backend we instead fall back to an explicit CPU
+        # offload path inside the Megatron actor (see ``MegatronTrainRayActor``
+        # ``sleep`` / ``wake_up``), so we must NOT preload the .so here.
+        rollout_backend = getattr(self.args, "rollout_backend", "sglang")
+        if (
+            self.args.offload_train
+            and self.args.train_backend == "megatron"
+            and rollout_backend != "vllm"
+        ):
             import torch_memory_saver
 
             dynlib_path = os.path.join(

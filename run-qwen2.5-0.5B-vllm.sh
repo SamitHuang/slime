@@ -84,11 +84,11 @@ OPTIMIZER_ARGS=(
 )
 
 WANDB_ARGS=(
-   --use-wandb
-   --wandb-host https://wandb.ai/
-   --wandb-entity samithuang
-   --wandb-project slime-rl
-   --wandb-group qwen2.5-0.5B-gsm8k-vllm
+   # --use-wandb
+   # --wandb-host https://wandb.ai/
+   # --wandb-entity samithuang
+   # --wandb-project slime-rl
+   # --wandb-group qwen2.5-0.5B-gsm8k-vllm
 )
 
 VLLM_ARGS=(
@@ -97,6 +97,8 @@ VLLM_ARGS=(
    --rollout-server-concurrency 512
    --use-slime-router
    --slime-router-middleware-paths slime.router.middleware_hub.radix_tree_middleware.RadixTreeMiddleware
+   # Uncomment below to enable colocate mode (IPC weight transfer, same GPU)
+   --colocate
 )
 
 MISC_ARGS=(
@@ -113,7 +115,7 @@ ray start --head --node-ip-address 127.0.0.1 --num-gpus 2 --disable-usage-stats
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json='{
      "env_vars": {
-        "PYTHONPATH": "/root/Megatron-LM",
+        "PYTHONPATH": "/root/Megatron-LM:/data/n0090/SLIME_PJ/new_version/local_package",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
         "NCCL_ALGO": "Ring",
         "NCCL_IB_DISABLE": "1",

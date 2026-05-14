@@ -168,7 +168,10 @@ def named_params_and_buffers(
 
 
 def _maybe_get_cpu_backup(x: torch.Tensor):
-    from torch_memory_saver import torch_memory_saver
+    try:
+        from torch_memory_saver import torch_memory_saver
+    except Exception:  # noqa: BLE001 - native lib may be unavailable (e.g. vLLM backend)
+        return x
 
     if (cpu_tensor := torch_memory_saver.get_cpu_backup(x)) is not None:
         return cpu_tensor
