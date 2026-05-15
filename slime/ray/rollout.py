@@ -1056,7 +1056,7 @@ def _start_vllm_rollout_servers(args, pg) -> dict[str, RolloutServer]:
     first_host = args.sglang_router_ip
     first_port = args.sglang_router_port
 
-    group = EngineGroup(
+    group = ServerGroup(
         args=args,
         pg=pg,
         all_engines=engines,
@@ -1066,10 +1066,19 @@ def _start_vllm_rollout_servers(args, pg) -> dict[str, RolloutServer]:
         rank_offset=0,
         gpu_offset=0,
         sglang_overrides={},
+        needs_offload=getattr(args, "offload_rollout", False),
+        model_path=getattr(args, "hf_checkpoint", None),
         router_ip=first_host,
         router_port=first_port,
     )
-    return {"default": RolloutServer(engine_groups=[group], router_ip=first_host, router_port=first_port, model_name="default")}
+    return {
+        "default": RolloutServer(
+            server_groups=[group],
+            router_ip=first_host,
+            router_port=first_port,
+            model_name="default",
+        )
+    }
 def _compute_rollout_offset(args) -> int:
     """Offset (in PG bundle slots) where rollout GPUs start."""
     if args.debug_train_only or args.debug_rollout_only or args.colocate:
