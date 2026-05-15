@@ -96,6 +96,7 @@ VLLM_ARGS=(
    --rollout-num-gpus-per-engine 1
    --rollout-server-concurrency 512
    --use-slime-router
+   --vllm-gpu-memory-utilization 0.2
    --slime-router-middleware-paths slime.router.middleware_hub.radix_tree_middleware.RadixTreeMiddleware
    # Uncomment below to enable colocate mode (IPC weight transfer, same GPU)
    --colocate
@@ -115,7 +116,7 @@ ray start --head --node-ip-address 127.0.0.1 --num-gpus 2 --disable-usage-stats
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json='{
      "env_vars": {
-        "PYTHONPATH": "/root/Megatron-LM:/data/n0090/SLIME_PJ/new_version/local_package",
+        "PYTHONPATH": "/root/Megatron-LM",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
         "NCCL_ALGO": "Ring",
         "NCCL_IB_DISABLE": "1",
