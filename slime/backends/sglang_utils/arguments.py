@@ -22,12 +22,6 @@ def add_sglang_router_arguments(parser):
         help="Port of the SGLang router",
     )
     parser.add_argument(
-        "--sglang-router-policy",
-        type=str,
-        default=None,
-        help="Routing policy for the SGLang router (e.g., 'consistent_hashing', 'round_robin')",
-    )
-    parser.add_argument(
         "--sglang-router-request-timeout-secs",
         type=int,
         default=14400,
@@ -130,7 +124,7 @@ def add_sglang_arguments(parser):
         default=None,
         help=(
             "Path to a YAML config for SGLang engine deployment. "
-            "Defines engine_groups with worker_type (regular/prefill/decode/placeholder), "
+            "Defines server_groups with worker_type (regular/prefill/decode/placeholder), "
             "num_gpus per group, and optional per-group 'overrides' dict of "
             "ServerArgs field names that override the base --sglang-* CLI args. "
             "Placeholder groups reserve GPU slots without creating engines. "
@@ -173,14 +167,14 @@ def validate_args(args):
 
     assert not (
         getattr(args, "sglang_config", None) is not None and getattr(args, "prefill_num_servers", None) is not None
-    ), "sglang_config and prefill_num_servers are mutually exclusive. Use engine_groups in the YAML config instead."
+    ), "sglang_config and prefill_num_servers are mutually exclusive. Use server_groups in the YAML config instead."
 
 
 def sglang_parse_args():
     """
     Parse sglang server arguments independently using a separate ArgumentParser.
     Uses parse_known_args() to only consume sglang-related arguments from sys.argv,
-    allowing the remaining arguments to be parsed by megatron/fsdp separately.
+    allowing the remaining arguments to be parsed by megatron separately.
 
     Returns:
         argparse.Namespace: Parsed sglang arguments (all attributes prefixed with sglang_).

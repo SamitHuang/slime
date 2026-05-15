@@ -6,7 +6,13 @@ from slime.utils.types import Sample
 
 @dataclass
 class RolloutBackendRequest:
-    """Backend-agnostic rollout request."""
+    """Backend-agnostic rollout request.
+
+    For multimodal requests, callers should set both ``text`` (the raw prompt
+    with image placeholders) and ``image_data``. Backends that natively expand
+    image placeholders (SGLang) will prefer ``text`` over ``input_ids`` in this
+    case so the server-side processor can do the expansion.
+    """
 
     input_ids: list[int]
     sampling_params: dict[str, Any]
@@ -14,6 +20,7 @@ class RolloutBackendRequest:
     return_routed_experts: bool = False
     image_data: list[str] | None = None
     session_id: str | None = None
+    text: str | None = None
 
 
 @dataclass

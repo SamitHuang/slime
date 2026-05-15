@@ -82,6 +82,7 @@ def monkey_patch_torch_dist():
     dist.all_to_all = get_new_comm_function(dist.all_to_all)
     dist.all_to_all_single = get_new_comm_function(dist.all_to_all_single)
     dist.broadcast = get_new_comm_function(dist.broadcast)
+    dist.broadcast_object_list = get_new_comm_function(dist.broadcast_object_list)
     dist.reduce = get_new_comm_function(dist.reduce)
     dist.reduce_scatter = get_new_comm_function(dist.reduce_scatter)
     dist.reduce_scatter_tensor = get_new_comm_function(dist.reduce_scatter_tensor)
@@ -295,7 +296,7 @@ def reload_process_groups():
 def _wrap_low_level_call():
     try:
         mem_info = available_memory()
-        if mem_info["free_GB"] < 5:
+        if mem_info["free_GB"] < 3:
             clear_memory()
         yield
     except Exception as e:

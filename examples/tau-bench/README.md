@@ -25,11 +25,11 @@ cd /root/slime/examples/tau-bench
 python tau1_mock.py --local_dir /root/tau-bench/
 ```
 
-Initialize the Qwen2.5-3B-Instruct model needed for tool use:
+Initialize the Qwen3-4B-Instruct-2507 model needed for tool use:
 
 ```bash
 # hf checkpoint
-huggingface-cli download Qwen/Qwen3-4B-Instruct-2507 --local-dir /root/Qwen3-4B-Instruct-2507
+hf download Qwen/Qwen3-4B-Instruct-2507 --local-dir /root/Qwen3-4B-Instruct-2507
 
 # mcore checkpoint
 cd /root/slime

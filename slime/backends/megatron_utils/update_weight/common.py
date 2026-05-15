@@ -67,9 +67,12 @@ def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
     dist.all_gather(param_partitions, param.data, group=tp_group)
     partition_dim = param.partition_dim
     stride = getattr(param, "partition_stride", 1)
+    assert param.partition_stride == 1 or (
+        param.partition_stride == 2 and "linear_fc1" in name
+    ), "partition_stride != 1 is not supported"
     # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
     # TODO: check only GLU is used.
-    if "linear_fc1.weight" in name:
+    if "linear_fc1.weight" in name or "linear_fc1.bias" in name:
         param_partitions = [p.chunk(2, dim=0) for p in param_partitions]
         param_partitions = [p[0] for p in param_partitions] + [p[1] for p in param_partitions]
         # GLU rechunking already reverses the stride=2 interleaving, so use
@@ -134,7 +137,7 @@ def all_gather_params_async(
             # Process the gathered partitions (same logic as original all_gather_param)
             # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
             # TODO: check only GLU is used.
-            if "linear_fc1.weight" in info.name:
+            if "linear_fc1.weight" in info.name or "linear_fc1.bias" in info.name:
                 param_partitions = [p.chunk(2, dim=0) for p in param_partitions]
                 param_partitions = [p[0] for p in param_partitions] + [p[1] for p in param_partitions]
                 # GLU rechunking already reverses the stride=2 interleaving.
@@ -232,27 +235,27 @@ def _named_params_and_buffers_global(
 
                 # MTP layer indices start from 0
                 layer_idx, rest = match.groups()
-                expert_pattern = r"transformer_layer.mlp.experts\.(.+)\.weight(\d+)"
+                expert_pattern = r"transformer_layer\.mlp\.experts\.(.+)\.(weight|bias)(\d+)"
                 match = re.match(expert_pattern, rest)
                 if not match:
                     yield name, param
                     continue
 
-                rest, expert_idx = match.groups()
+                rest, param_type, expert_idx = match.groups()
                 expert_idx = int(expert_idx) + expert_offset
-                yield f"module.module.mtp.layers.{layer_idx}.transformer_layer.mlp.experts.{rest}.weight{expert_idx}", param
+                yield f"module.module.mtp.layers.{layer_idx}.transformer_layer.mlp.experts.{rest}.{param_type}{expert_idx}", param
                 continue
 
             layer_idx, rest = match.groups()
             layer_idx = int(layer_idx) + layer_offset
 
             # this is hardcoded for te grouped matmul
-            expert_pattern = r"mlp.experts\.(.+)\.weight(\d+)"
+            expert_pattern = r"mlp\.experts\.(.+)\.(weight|bias)(\d+)"
             match = re.match(expert_pattern, rest)
             if match:
-                rest, expert_idx = match.groups()
+                rest, param_type, expert_idx = match.groups()
                 expert_idx = int(expert_idx) + expert_offset
-                yield f"module.module.decoder.layers.{layer_idx}.mlp.experts.{rest}.weight{expert_idx}", param
+                yield f"module.module.decoder.layers.{layer_idx}.mlp.experts.{rest}.{param_type}{expert_idx}", param
             else:
                 yield f"module.module.decoder.layers.{layer_idx}.{rest}", param
 

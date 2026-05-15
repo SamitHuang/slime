@@ -64,13 +64,20 @@ class VLLMClient(RolloutBackendClient):
         """Send SGLang-format request through the SlimeRouter → sidecar pipeline."""
 
         payload = {
-            "input_ids": request.input_ids,
             "sampling_params": request.sampling_params,
             "return_logprob": request.return_logprob,
             "stream": False,
         }
-        if request.image_data:
+        # Multimodal: send raw text + image_data so the translation sidecar can
+        # apply the chat template and forward to vLLM. Otherwise send tokenized
+        # input_ids.
+        if request.image_data and request.text is not None:
+            payload["text"] = request.text
             payload["image_data"] = request.image_data
+        else:
+            payload["input_ids"] = request.input_ids
+            if request.image_data:
+                payload["image_data"] = request.image_data
 
         url = f"{base_url.rstrip('/')}/generate"
         output = await post(url, payload, headers=headers)
@@ -111,8 +118,12 @@ class VLLMClient(RolloutBackendClient):
         headers: dict | None = None,
     ) -> RolloutBackendResponse:
         sp = request.sampling_params
+        # vLLM /v1/completions accepts a string or list of token IDs as "prompt".
+        # Prefer raw text when provided (e.g. multimodal callers); fall back to
+        # the pre-tokenized input_ids otherwise.
+        prompt_field = request.text if request.text is not None else request.input_ids
         payload = {
-            "prompt": request.input_ids,
+            "prompt": prompt_field,
             "max_tokens": sp.get("max_new_tokens", 1024),
             "temperature": sp.get("temperature", 1.0),
             "top_p": sp.get("top_p", 1.0),

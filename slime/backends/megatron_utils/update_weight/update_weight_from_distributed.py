@@ -231,6 +231,14 @@ class UpdateWeightFromDistributed:
                 engine_gpu_counts=engine_gpu_counts,
             )
 
+    def disconnect_rollout_engines(self) -> None:
+        if not getattr(self, "_is_pp_src_rank", False) or self._model_update_groups is None:
+            return
+        disconnect_rollout_engines_from_distributed(
+            self.args, self._group_name, self._model_update_groups, self.rollout_engines
+        )
+        self._model_update_groups = None
+
     @torch.no_grad()
     def update_weights(self) -> None:
         """
@@ -495,11 +503,11 @@ def connect_rollout_engines_from_distributed(
     # Fire engine init remotes first (non-blocking Ray calls).
     refs = [
         engine.init_weights_update_group.remote(
-            master_address,
-            master_port,
-            cumulative[i] + 1,
-            world_size,
-            group_name,
+            master_address=master_address,
+            master_port=master_port,
+            rank_offset=cumulative[i] + 1,
+            world_size=world_size,
+            group_name=group_name,
             backend="nccl",
         )
         for i, engine in enumerate(rollout_engines)

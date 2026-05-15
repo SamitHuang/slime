@@ -31,13 +31,19 @@ class SGLangClient(RolloutBackendClient):
         headers: dict | None = None,
     ) -> RolloutBackendResponse:
         payload = {
-            "input_ids": request.input_ids,
             "sampling_params": request.sampling_params,
             "return_logprob": request.return_logprob,
             "return_routed_experts": request.return_routed_experts,
         }
-        if request.image_data:
+        # For multimodal: send raw text so SGLang's server-side processor can
+        # expand image placeholders. Otherwise send pre-tokenized input_ids.
+        if request.image_data and request.text is not None:
+            payload["text"] = request.text
             payload["image_data"] = request.image_data
+        else:
+            payload["input_ids"] = request.input_ids
+            if request.image_data:
+                payload["image_data"] = request.image_data
 
         url = f"{base_url.rstrip('/')}/generate"
         output = await post(url, payload, headers=headers)

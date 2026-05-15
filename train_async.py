@@ -2,7 +2,7 @@ import ray
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from slime.utils.arguments import parse_args
-from slime.utils.logging_utils import configure_logger, init_tracking
+from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking, update_tracking_open_metrics
 from slime.utils.misc import should_run_periodic_action
 
 
@@ -18,10 +18,14 @@ def train(args):
     # need to initialize rollout manager first to calculate num_rollout
     rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
 
+    # Update primary W&B with SGLang metrics endpoint now that servers are up.
+    router_addr = ray.get(rollout_manager.get_metrics_router_addr.remote())
+    update_tracking_open_metrics(args, router_addr)
+
     # create the actor and critic models
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
 
-    # always update weight first so that sglang has the loaded weights from training.
+    # Always push actor weights to rollout once weights are loaded.
     actor_model.update_weights()
 
     if args.check_weight_update_equal:
@@ -39,18 +43,21 @@ def train(args):
             rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
 
         if args.use_critic:
-            critic_train_handle = critic_model.async_train(rollout_id, rollout_data_curr_ref)
-            if rollout_id >= args.num_critic_only_steps:
-                ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
-            ray.get(critic_train_handle)
+            actor_trains_this_step = rollout_id >= args.num_critic_only_steps
+            value_refs = critic_model.async_train(rollout_id, rollout_data_curr_ref)
+            if actor_trains_this_step:
+                ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref, external_data=value_refs))
+            else:
+                ray.get(value_refs)
         else:
             ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
 
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
-            actor_model.save_model(
-                rollout_id,
-                force_sync=rollout_id == args.num_rollout - 1,
-            )
+            if (not args.use_critic) or rollout_id >= args.num_critic_only_steps:
+                actor_model.save_model(
+                    rollout_id,
+                    force_sync=rollout_id == args.num_rollout - 1,
+                )
             if args.use_critic:
                 critic_model.save_model(
                     rollout_id,
@@ -69,6 +76,7 @@ def train(args):
             ray.get(rollout_manager.eval.remote(rollout_id))
 
     ray.get(rollout_manager.dispose.remote())
+    finish_tracking(args)
 
 
 if __name__ == "__main__":
