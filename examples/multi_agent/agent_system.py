@@ -115,10 +115,10 @@ class RewriterAgent(Agent):
     async def rewrite(self, args, problem_statement, previous_solutions: list[str]) -> str:
         """Generates the rewrited solution."""
 
-        # Build the prompt template dynamically.
+        # 动态生成模板
         template = generate_rewriter_template(len(previous_solutions))
 
-        # Populate the template arguments.
+        # 构建参数字典
         format_params = {"problem_statement": problem_statement}
         for i, solution in enumerate(previous_solutions):
             format_params[f"solution{i+1}"] = solution
@@ -136,10 +136,10 @@ class SelectorAgent(Agent):
     async def select(self, args, problem_statement, candidate_solutions: list[str]) -> str:
         """Generates the rewrited solution."""
 
-        # Build the prompt template dynamically.
+        # 动态生成模板
         template = generate_select_template(len(candidate_solutions))
 
-        # Populate the template arguments.
+        # 构建参数字典
         format_params = {"problem_statement": problem_statement}
         for i, solution in enumerate(candidate_solutions):
             format_params[f"solution{i+1}"] = solution
@@ -170,7 +170,7 @@ async def rewrite_worker(args, previous_solutions, problem_statement, worker_id)
 
 async def solver_worker(args, problem_statement, worker_id):
     """
-    Run a single solver pipeline.
+    单组 solver 流程。
     """
 
     try:
@@ -186,10 +186,10 @@ async def solver_worker(args, problem_statement, worker_id):
 
 async def run_agent_system(args, sample):
     """
-    Run `num_parallel` pipelines concurrently.
+    并发运行 num_parallel 组 pipeline。
     """
 
-    args = deepcopy(args)  # Deep copy args because rollout_with_multi_agents mutates them.
+    args = deepcopy(args)  # 深拷贝 args，因为 args 在 rollout_with_multi_agents 中会被修改
     args.sample = sample
     args.results_dict = {"solver": [], "rewriter": [], "selector": []}
 
@@ -219,7 +219,7 @@ async def run_agent_system(args, sample):
     ]
     rewrited_solutions_raw = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Filter out failed tasks and keep only valid rewritten solutions.
+    # 处理异常结果
     rewrited_solutions = []
     for _i, result in enumerate(rewrited_solutions_raw):
         if isinstance(result, str):
@@ -258,8 +258,7 @@ async def run_agent_system(args, sample):
                     args.results_dict["selector"][0].reward = sample.reward
                     break
 
-    ## If the final answer is correct, add a positive bonus to all rewards.
-    ## Otherwise, add a negative penalty to all rewards.
+    ## 如果最终答案正确，对所有reward添加正向的奖励；如果最终答案不正确，对所有reward添加负向的惩罚。
     if args.results_dict["selector"][0].reward == 1:
         reward_adjustment(args.results_dict["solver"], args.correct_reward_weight)
         reward_adjustment(args.results_dict["rewriter"], args.correct_reward_weight)

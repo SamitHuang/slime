@@ -1,4 +1,4 @@
-## Prompt templates used to generate different prompt variants.
+## 定义了一些 prompts 的模板，用于生成不同的 prompts
 
 
 SOLVER_PROMPT_TEMPLATE = """{problem_statement}"""

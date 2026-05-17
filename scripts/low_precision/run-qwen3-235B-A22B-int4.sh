@@ -119,6 +119,7 @@ SGLANG_ARGS=(
   #  --sglang-dp-size 4
    --sglang-ep-size 8
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
+   --use-slime-router
 )
 
 

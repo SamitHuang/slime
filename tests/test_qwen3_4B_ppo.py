@@ -1,5 +1,4 @@
 import os
-import tempfile
 
 import slime.utils.external_utils.command_utils as U
 
@@ -22,22 +21,6 @@ def prepare():
 
 
 def execute():
-    megatron_config = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
-    megatron_config.write(
-        """
-megatron:
-  - name: default
-    role: critic
-    overrides:
-      lr: 1e-5
-  - name: default
-    role: actor
-    overrides:
-      lr: 1e-6
-"""
-    )
-    megatron_config.close()
-
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/{MODEL_NAME}_torch_dist "
 
     rollout_args = (
@@ -86,6 +69,7 @@ megatron:
         "--eps-clip 4e-4 "
         "--num-critic-only-steps 1 "
         "--normalize-advantages "
+        "--critic-lr 1e-5 "
     )
 
     optimizer_args = (
@@ -118,12 +102,11 @@ megatron:
         # need to comment this when using model with MLA
         "--attention-backend flash "
         "--actor-num-nodes 1 "
-        "--actor-num-gpus-per-node 8 "
+        "--actor-num-gpus-per-node 4 "
         "--colocate "
     )
 
     train_args = (
-        f"--megatron-config-path {megatron_config.name} "
         f"{ckpt_args} "
         f"{rollout_args} "
         f"{optimizer_args} "
