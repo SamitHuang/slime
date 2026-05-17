@@ -58,7 +58,12 @@ class TrainRayActor(RayActor):
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(f"cuda:{local_rank}")
 
+        # Use hybrid backend when FSDP CPU offload is enabled with a CPU backend
         backend = args.distributed_backend
+        if getattr(args, "fsdp_cpu_offload", False) and getattr(args, "fsdp_cpu_backend", None):
+            cpu_backend = args.fsdp_cpu_backend
+            backend = f"cpu:{cpu_backend},cuda:{args.distributed_backend}"
+            logger.info(f"FSDP CPU offload enabled, using hybrid backend: {backend}")
 
         dist.init_process_group(
             backend=backend,
@@ -92,8 +97,6 @@ class TrainRayActor(RayActor):
             logger.info(f"Warning: Failed to set NUMA affinity: {e}")
 
     def clear_memory(self):
-        if self.args.debug_rollout_only:
-            return
         print_memory("before TrainRayActor.clear_memory")
         clear_memory()
         print_memory("after TrainRayActor.clear_memory")
@@ -107,7 +110,7 @@ class TrainRayActor(RayActor):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def train(self, rollout_id, rollout_data_ref, external_data=None):
+    def train(self, rollout_id, rollout_data_ref):
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -116,6 +119,10 @@ class TrainRayActor(RayActor):
 
     @abc.abstractmethod
     def update_weights(self):
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def connect_actor_critic(self, critic_group):
         raise NotImplementedError
 
     @abc.abstractmethod
