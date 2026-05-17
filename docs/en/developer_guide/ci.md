@@ -6,7 +6,7 @@ slime uses GitHub Actions for CI. Tests are triggered by **PR labels** — addin
 
 The workflow is defined in `.github/workflows/pr-test.yml` (auto-generated from `pr-test.yml.j2`). Each CI job:
 
-1. Runs on a self-hosted GPU runner inside a Docker container (`slimerl/slime:latest`).
+1. Runs on a self-hosted GPU runner via `docker run`; most tests use `slimerl/slime:latest`, while image validation uses `slimerl/slime-test:latest`.
 2. Installs slime with `pip install -e . --no-deps`.
 3. Acquires the required GPUs via `tests/ci/gpu_lock_exec.py --count <num_gpus>`.
 4. Executes the test file: `python <test_path>.py` or `python tests/<test_file>.py`, depending on whether the test lives under `tests/` or a subdirectory such as `tests/plugin_contracts/`.
@@ -20,9 +20,8 @@ Add a label to your PR to trigger the corresponding test suite:
 | Label | Job | Description |
 |---|---|---|
 | `run-ci-short` | `e2e-test-short` | Lightweight smoke tests with Qwen2.5-0.5B (4 GPUs). Fast feedback loop. |
-| `run-ci-fsdp` | `e2e-test-fsdp` | FSDP backend tests (true on-policy, VL, megatron-fsdp alignment). |
 | `run-ci-megatron` | `e2e-test-megatron` | Core Megatron training tests covering dense, MoE, PPO, MTP, OPD, etc. |
-| `run-ci-precision` | `e2e-test-precision` | Numerical precision validation (parallel check, megatron-fsdp alignment). |
+| `run-ci-precision` | `e2e-test-precision` | Numerical precision validation (parallel check). |
 | `run-ci-ckpt` | `e2e-test-ckpt` | Checkpoint save/load correctness (sync and async-save). |
 | `run-ci-image` | `e2e-test-image` | Full test suite run on `slimerl/slime-test:latest` image (for image validation). |
 | `run-ci-changed` | `e2e-test-changed` | **Dynamically** detects new/modified test files in the PR and runs only those. |
@@ -57,7 +56,7 @@ Since this includes every test, it consumes significant GPU time — use it spar
 This is the primary label for validating Megatron-backend changes. It covers:
 
 - Dense models: GLM4-9B, Qwen3-4B (PPO)
-- MoE models: Qwen3-30B-A3B (with/without DeepEP + FP8), Moonlight-16B-A3B
+- MoE models: Qwen3-30B-A3B (with DeepEP + FP8), Qwen3.6-35B-A3B PD + Mooncake, Moonlight-16B-A3B
 - Specialized: MiMo-7B MTP, Qwen2.5-0.5B debug rollout-then-train, OPD with sglang teacher
 
 All tests use 8 GPUs. If you are modifying Megatron training logic, loss computation, or checkpoint conversion, this is the label to use.
@@ -76,7 +75,7 @@ NUM_GPUS = 4  # This constant is used by run-ci-changed
 
 def prepare():
     U.exec_command("mkdir -p /root/models /root/datasets")
-    U.exec_command(f"huggingface-cli download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
+    U.exec_command(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
     # Download datasets as needed ...
 
 def execute():

@@ -16,7 +16,7 @@ NUM_GPUS = 8
 SGLANG_CONFIG_YAML = """\
 sglang:
   - name: default
-    engine_groups:
+    server_groups:
       - worker_type: regular
         num_gpus: 4
         num_gpus_per_engine: 2
@@ -30,7 +30,7 @@ sglang:
 
 def prepare():
     U.exec_command("mkdir -p /root/models /root/datasets")
-    U.exec_command(f"huggingface-cli download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
+    U.exec_command(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
     U.hf_download_dataset("zhuzilin/gsm8k")
 
 

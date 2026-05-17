@@ -17,6 +17,7 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
+from slime.utils.megatron_bridge_utils import patch_auto_bridge_hf_config
 from slime.utils.misc import load_function
 
 
@@ -54,7 +55,7 @@ class LinearForLastLayer(torch.nn.Linear):
         return logits, None
 
 
-def get_model_provider_func(
+def _get_model_provider_func(
     args: argparse.Namespace,
     role: Literal["actor", "critic"] = "actor",
 ):
@@ -83,7 +84,9 @@ def get_model_provider_func(
     if args.megatron_to_hf_mode == "bridge":
         from megatron.bridge import AutoBridge
 
-        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
+        import slime_plugins.megatron_bridge  # noqa: F401  # register custom bridges
+
+        bridge = patch_auto_bridge_hf_config(AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True))
         provider = bridge.to_megatron_provider(load_weights=False)
         # TODO: we should not manually set this...
         provider.tensor_model_parallel_size = args.tensor_model_parallel_size
@@ -91,11 +94,29 @@ def get_model_provider_func(
         provider.expert_model_parallel_size = args.expert_model_parallel_size
         provider.expert_tensor_parallel_size = args.expert_tensor_parallel_size
         provider.sequence_parallel = args.sequence_parallel
+        provider.context_parallel_size = args.context_parallel_size
+        provider.variable_seq_lengths = args.variable_seq_lengths
+        if hasattr(args, "moe_token_dispatcher_type"):
+            provider.moe_token_dispatcher_type = args.moe_token_dispatcher_type
         if getattr(args, "decoder_first_pipeline_num_layers", None) is not None:
             provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers
         if getattr(args, "decoder_last_pipeline_num_layers", None) is not None:
             provider.num_layers_in_last_pipeline_stage = args.decoder_last_pipeline_num_layers
         provider.finalize()
+
+        if role == "critic":
+            _original_provide = provider.provide
+
+            def _critic_provide(pre_process=True, post_process=True, vp_stage=None):
+                model = _original_provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+                if post_process:
+                    model.output_layer = LinearForLastLayer(
+                        input_size=model.config.hidden_size, output_size=1, config=model.config
+                    )
+                return model
+
+            return _critic_provide
+
         return provider.provide
 
     def model_provider(pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None) -> GPTModel:
@@ -120,7 +141,17 @@ def get_model_provider_func(
             transformer_layer_spec = import_module(args.spec)
             # Allow the spec to be a function so that user can use customized Megatron easier.
             if callable(transformer_layer_spec):
-                transformer_layer_spec = transformer_layer_spec(args, config, vp_stage)
+                result = transformer_layer_spec(args, config, vp_stage)
+                # If the result is itself a model provider (callable with pre_process param),
+                # delegate model construction to it directly (e.g. glm-omni VL model).
+                if callable(result) and "pre_process" in inspect.signature(result).parameters:
+                    model = result(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+                    if post_process and role == "critic":
+                        model.output_layer = LinearForLastLayer(
+                            input_size=config.hidden_size, output_size=1, config=config
+                        )
+                    return model
+                transformer_layer_spec = result
         else:
             if args.num_experts:
                 # Define the decoder block spec
@@ -209,13 +240,21 @@ def get_model_provider_func(
 
 
 def wrap_model_provider_with_freeze(original_provider, args):
-    def wrapped_provider(pre_process=True, post_process=True, vp_stage=None):
+    def wrapped_provider(
+        pre_process=True,
+        post_process=True,
+        **kwargs,
+    ):
         sig = inspect.signature(original_provider)
-        if "vp_stage" in sig.parameters:
-            model = original_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
-        else:
-            model = original_provider(pre_process=pre_process, post_process=post_process)
+        provider_kwargs = {
+            "pre_process": pre_process,
+            "post_process": post_process,
+        }
+        for key in ["vp_stage", "config", "pg_collection"]:
+            if key in sig.parameters:
+                provider_kwargs[key] = kwargs.get(key, None)
 
+        model = original_provider(**provider_kwargs)
         freeze_model_params(model, args)
 
         return model
@@ -223,8 +262,12 @@ def wrap_model_provider_with_freeze(original_provider, args):
     return wrapped_provider
 
 
+def get_model_provider_func(args, role="actor"):
+    return wrap_model_provider_with_freeze(_get_model_provider_func(args, role), args)
+
+
 def freeze_model_params(model: GPTModel, args: argparse.Namespace):
-    if args.only_train_params_name_list:
+    if getattr(args, "only_train_params_name_list", None):
         for name, param in model.named_parameters():
             param.requires_grad = False
             for pattern in args.only_train_params_name_list:
@@ -232,7 +275,7 @@ def freeze_model_params(model: GPTModel, args: argparse.Namespace):
                     param.requires_grad = True
                     break
 
-    if args.freeze_params_name_list:
+    if getattr(args, "freeze_params_name_list", None):
         for name, param in model.named_parameters():
             for pattern in args.freeze_params_name_list:
                 if re.search(pattern, name):
