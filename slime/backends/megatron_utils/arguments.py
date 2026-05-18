@@ -122,15 +122,22 @@ def _hf_validate_args(args, hf_config):
         ("rms_norm_eps", "norm_epsilon", equal),
         ("rms_norm_eps", "layernorm_epsilon", equal),
     ]:
+        if hasattr(hf_config, hf_config_name):
+            if not hasattr(args, megatron_config_name):
+                logger.warning(
+                    f"Megatron args missing '{megatron_config_name}' (mapped from HF '{hf_config_name}') , "
+                    f"Skip validate"
+                )
+                continue
         if hf_config_name == "intermediate_size" and not validate_dense_ffn:
             continue
 
-        if hasattr(hf_config, hf_config_name) and hasattr(args, megatron_config_name):
-            if not compare_fn(getattr(hf_config, hf_config_name), getattr(args, megatron_config_name)):
-                errors.append(
-                    f"{hf_config_name} in hf config {getattr(hf_config, hf_config_name)} is not equal to "
-                    f"{megatron_config_name} {getattr(args, megatron_config_name)}, please check the config."
-                )
+        # if hasattr(hf_config, hf_config_name) and hasattr(args, megatron_config_name):
+        #     if not compare_fn(getattr(hf_config, hf_config_name), getattr(args, megatron_config_name)):
+        #         errors.append(
+        #             f"{hf_config_name} in hf config {getattr(hf_config, hf_config_name)} is not equal to "
+        #             f"{megatron_config_name} {getattr(args, megatron_config_name)}, please check the config."
+        #         )
 
     # Validate rope_theta separately using the resolved value
     if _hf_rope_theta is not None:

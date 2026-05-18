@@ -12,10 +12,14 @@ import numpy as np
 import ray
 import torch
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
+
+# GPU memory-tag constants (originally from sglang.srt.constants).
+# Duplicated here to avoid a hard sglang dependency when running the vLLM backend.
+GPU_MEMORY_TYPE_KV_CACHE = "kv_cache"
+GPU_MEMORY_TYPE_WEIGHTS = "weights"
+GPU_MEMORY_TYPE_CUDA_GRAPH = "cuda_graph"
 
 from slime.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupConfig, SglangConfig
-from slime.backends.sglang_utils.sglang_engine import SGLangEngine
 from slime.rollout.base_types import call_rollout_fn
 from slime.utils import logging_utils
 from slime.utils.health_monitor import RolloutHealthMonitor
@@ -88,7 +92,14 @@ class ServerGroup:
 
         pg, reordered_bundle_indices, reordered_gpu_ids = self.pg
 
-        RolloutRayActor = ray.remote(SGLangEngine)
+        if getattr(self.args, "rollout_backend", "sglang") == "vllm":
+            from slime.backends.vllm_utils.vllm_engine import VLLMEngine
+
+            RolloutRayActor = ray.remote(VLLMEngine)
+        else:
+            from slime.backends.sglang_utils.sglang_engine import SGLangEngine
+
+            RolloutRayActor = ray.remote(SGLangEngine)
 
         rollout_engines = []
         for i in range(len(self.all_engines)):
@@ -355,6 +366,7 @@ class RolloutManager:
 
         self.pg = pg
         self.args = args
+        self.rollout_backend = getattr(args, "rollout_backend", "sglang")
 
         data_source_cls = load_function(self.args.data_source_path)
         self.data_source = data_source_cls(args)
@@ -517,12 +529,22 @@ class RolloutManager:
             srv.onload(tags)
 
     def onload_weights(self):
-        for srv in self.servers.values():
-            srv.onload_weights()
+        # vLLM does not expose a separate weights-only resume: a single
+        # resume_memory_occupation reloads both weights and KV cache.  To keep
+        # the public ``onload_weights`` / ``onload_kv`` contract on the train
+        # side unchanged, we load everything here and make ``onload_kv`` a
+        # no-op for the vLLM backend.
+        if self.rollout_backend == "vllm":
+            self.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE])
+        else:
+            self.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS])
 
     def onload_kv(self):
-        for srv in self.servers.values():
-            srv.onload_kv()
+        # See ``onload_weights``: for vLLM, weights+KV are already resumed
+        # together, so this is a no-op to avoid a double-resume.
+        if self.rollout_backend == "vllm":
+            return
+        self.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
 
     def recover_updatable_engines(self):
         """Restart any dead rollout engines and update num_new_engines for update_weights detection.
@@ -909,45 +931,52 @@ def _allocate_rollout_engine_addr_and_ports_normal(
 
 
 def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool = False) -> tuple[str, int]:
-    """Start sglang_router and return (router_ip, router_port).
+    """Start sgl router or slime router and return (router_ip, router_port).
 
     If ``args.sglang_router_ip`` is already set (e.g. by the user) and
     ``force_new`` is False, skip launching and return the existing values.
     When ``force_new`` is True (multi-model), always allocate a fresh port.
     """
-    if not force_new and args.sglang_router_ip is not None:
+    if not force_new and getattr(args, "sglang_router_ip", None) is not None:
         return args.sglang_router_ip, args.sglang_router_port
 
     router_ip = _wrap_ipv6(get_host_info()[1])
     if force_new:
         router_port = find_available_port(random.randint(3000, 4000))
     else:
-        router_port = args.sglang_router_port
+        router_port = getattr(args, "sglang_router_port", None)
         if router_port is None:
             router_port = find_available_port(random.randint(3000, 4000))
 
-    from sglang_router.launch_router import RouterArgs
+    if args.use_slime_router:
+        assert not has_pd_disaggregation, "slime router does not support PD disaggregation."
+        import copy
 
-    from slime.utils.http_utils import run_router
+        from slime.router.router import run_router
 
-    router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
-    router_args.host = router_ip
-    router_args.port = router_port
-    router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
-    router_args.log_level = "warn"
-    router_args.request_timeout_secs = args.sglang_router_request_timeout_secs
+        router_args = copy.copy(args)
+        router_args.sglang_router_ip = router_ip
+        router_args.sglang_router_port = router_port
 
-    if has_pd_disaggregation:
-        router_args.pd_disaggregation = True
-        # Disable circuit breaker to prevent RDMA transfer timeouts from
-        # marking decode workers as dead. Timeouts are transient (PCIe
-        # contention under high load) and do not indicate a dead server.
-        router_args.disable_circuit_breaker = True
+    else:
+        from sglang_router.launch_router import RouterArgs  # noqa: delayed import — only needed for sglang router
 
-    # We will not use the health check from router.
-    router_args.disable_health_check = True
+        from slime.utils.http_utils import run_router
 
-    logger.info(f"Launch router with args: {router_args}")
+        router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
+        router_args.host = router_ip
+        router_args.port = router_port
+        router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
+        router_args.log_level = "warn"
+        router_args.request_timeout_secs = args.sglang_router_request_timeout_secs
+
+        if hasattr(args, "sglang_router_policy") and args.sglang_router_policy:
+            router_args.policy = args.sglang_router_policy
+
+        if has_pd_disaggregation:
+            router_args.pd_disaggregation = True
+
+        logger.info(f"Launch router with args: {router_args}")
 
     process = multiprocessing.Process(
         target=run_router,
@@ -958,10 +987,104 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
     # Wait 3 seconds
     time.sleep(3)
     assert process.is_alive()
-    logger.info(f"Router launched at {router_ip}:{router_port}, Prometheus port: {router_args.prometheus_port}")
+    logger.info(f"Router launched at {router_ip}:{router_port}")
     return router_ip, router_port
 
 
+def _start_vllm_rollout_servers(args, pg) -> dict[str, RolloutServer]:
+    """Start vLLM rollout server(s) with optional SlimeRouter.
+
+    When ``args.use_slime_router`` is True, a SlimeRouter is launched first
+    and each vLLM engine registers its translation sidecar with the router.
+    Otherwise, a single engine is started and used directly (no router).
+    """
+    pg_obj, reordered_bundle_indices, reordered_gpu_ids = pg
+    tp = args.rollout_num_gpus_per_engine
+    num_gpu_per_engine_local = min(tp, args.num_gpus_per_node)
+    num_engines = max(1, args.rollout_num_gpus // num_gpu_per_engine_local)
+
+    use_router = getattr(args, "use_slime_router", False)
+
+    # --- Launch the SlimeRouter if requested ---
+    if use_router:
+        router_ip, router_port = _start_router(args, has_pd_disaggregation=False)
+        args.sglang_router_ip = router_ip
+        args.sglang_router_port = router_port
+    else:
+        router_ip = None
+        router_port = None
+
+    env_vars = {name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST}
+
+    from slime.backends.vllm_utils.vllm_engine import VLLMEngine
+
+    VLLMRayActor = ray.remote(VLLMEngine)
+
+    engines = []
+    init_handles = []
+    for i in range(num_engines):
+        gpu_index = i * num_gpu_per_engine_local
+        gpu_ids = [int(reordered_gpu_ids[gpu_index + j]) for j in range(num_gpu_per_engine_local)]
+        scheduling_strategy = PlacementGroupSchedulingStrategy(
+            placement_group=pg_obj,
+            placement_group_capture_child_tasks=True,
+            placement_group_bundle_index=reordered_bundle_indices[gpu_index],
+        )
+
+        engine = VLLMRayActor.options(
+            num_cpus=0.2,
+            num_gpus=0.2,
+            scheduling_strategy=scheduling_strategy,
+            runtime_env={"env_vars": env_vars},
+        ).remote(args, rank=i, base_gpu_id=gpu_ids[0], gpu_ids=gpu_ids)
+
+        host, port = ray.get(engine._get_current_node_ip_and_free_port.remote(start_port=15000 + i * 10))
+
+        init_handles.append(
+            engine.init.remote(
+                port=port,
+                host=host,
+                router_ip=router_ip,
+                router_port=router_port,
+            )
+        )
+        engines.append(engine)
+
+        # Use the first engine's host for args if no router
+        if i == 0 and not use_router:
+            args.vllm_base_url = f"http://{host}:{port}"
+            args.sglang_router_ip = host
+            args.sglang_router_port = port
+
+    # Wait for all engines to be healthy + registered with router
+    ray.get(init_handles)
+
+    first_host = args.sglang_router_ip
+    first_port = args.sglang_router_port
+
+    group = ServerGroup(
+        args=args,
+        pg=pg,
+        all_engines=engines,
+        num_gpus_per_engine=args.rollout_num_gpus_per_engine,
+        num_new_engines=num_engines,
+        worker_type="regular",
+        rank_offset=0,
+        gpu_offset=0,
+        sglang_overrides={},
+        needs_offload=getattr(args, "offload_rollout", False),
+        model_path=getattr(args, "hf_checkpoint", None),
+        router_ip=first_host,
+        router_port=first_port,
+    )
+    return {
+        "default": RolloutServer(
+            server_groups=[group],
+            router_ip=first_host,
+            router_port=first_port,
+            model_name="default",
+        )
+    }
 def _compute_rollout_offset(args) -> int:
     """Offset (in PG bundle slots) where rollout GPUs start."""
     if args.debug_train_only or args.debug_rollout_only or args.colocate:
@@ -991,6 +1114,9 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
     Note: ``init_http_client`` should be called separately before this,
     as the HTTP client is shared across all servers.
     """
+    if getattr(args, "rollout_backend", "sglang") == "vllm":
+        return _start_vllm_rollout_servers(args, pg)
+
     config = _resolve_sglang_config(args)
 
     servers: dict[str, RolloutServer] = {}

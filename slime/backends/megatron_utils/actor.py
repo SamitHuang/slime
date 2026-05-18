@@ -9,8 +9,18 @@ import ray
 import torch
 import torch.distributed as dist
 from megatron.core import mpu
+from ray.actor import ActorHandle
 from torch_memory_saver import torch_memory_saver
 from transformers import AutoConfig, AutoTokenizer
+
+# torch_memory_saver is only used when the rollout backend is sglang (the
+# default). For the vLLM rollout backend we intentionally avoid importing it
+# (the preload .so is not loaded), so we resolve it lazily and tolerate the
+# import being unavailable.
+try:  # pragma: no cover - import guard
+    from torch_memory_saver import torch_memory_saver  # type: ignore
+except Exception:  # noqa: BLE001 - missing native lib should not crash import
+    torch_memory_saver = None  # type: ignore[assignment]
 
 from slime.ray.train_actor import TrainRayActor
 from slime.utils import train_dump_utils
@@ -35,6 +45,7 @@ from .model import forward_only, initialize_model_and_optimizer, save, train
 from .update_weight.common import named_params_and_buffers
 from .update_weight.update_weight_from_distributed import UpdateWeightFromDistributed
 from .update_weight.update_weight_from_tensor import UpdateWeightFromTensor
+from .update_weight.update_weight_from_tensor_vllm import UpdateVLLMWeightFromTensor
 
 logging.getLogger("megatron").setLevel(logging.WARNING)
 
@@ -77,9 +88,15 @@ class MegatronTrainRayActor(TrainRayActor):
         dist.barrier(group=get_gloo_group())
 
         if args.offload_train:
-            if (x := args.train_memory_margin_bytes) > 0:
-                logger.info(f"Set torch_memory_saver.memory_margin_bytes to {x}")
-                torch_memory_saver.memory_margin_bytes = x
+            if self._uses_torch_memory_saver():
+                if (x := args.train_memory_margin_bytes) > 0:
+                    logger.info(f"Set torch_memory_saver.memory_margin_bytes to {x}")
+                    torch_memory_saver.memory_margin_bytes = x
+            else:
+                logger.info(
+                    "offload_train enabled with rollout_backend=vllm: using CPU offload "
+                    "instead of torch_memory_saver."
+                )
 
         self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
             args, role
@@ -124,7 +141,14 @@ class MegatronTrainRayActor(TrainRayActor):
             hf_vocab = getattr(self.hf_config, "vocab_size", None)
             self.args.vocab_size = hf_vocab if hf_vocab is not None else self.tokenizer.vocab_size
 
-        update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
+        use_vllm_colocate = self.args.colocate and getattr(self.args, "rollout_backend", "sglang") == "vllm"
+        use_tensor_update = self.args.colocate and getattr(self.args, "rollout_backend", "sglang") != "vllm"
+        if use_vllm_colocate:
+            update_weight_cls = UpdateVLLMWeightFromTensor
+        elif use_tensor_update:
+            update_weight_cls = UpdateWeightFromTensor
+        else:
+            update_weight_cls = UpdateWeightFromDistributed
         self.weight_updater = update_weight_cls(
             self.args,
             self.model,
@@ -153,6 +177,130 @@ class MegatronTrainRayActor(TrainRayActor):
 
         return start_rollout_id
 
+    def _uses_torch_memory_saver(self) -> bool:
+        """Whether GPU memory should be released via torch_memory_saver.
+
+        torch_memory_saver relies on an LD_PRELOAD-injected allocator hook that
+        is only set up for the sglang rollout backend (see ``RayTrainGroup``).
+        For the vLLM rollout backend we fall back to an explicit CPU-offload
+        path that moves model parameters and optimizer state to CPU.
+        """
+        if not self.args.offload_train:
+            return False
+        if torch_memory_saver is None:
+            return False
+        return getattr(self.args, "rollout_backend", "sglang") != "vllm"
+
+    @torch.no_grad()
+    def _move_optimizer_state_to_device(self, device: str | torch.device) -> None:
+        """Move all tensor entries in optimizer state to ``device``.
+
+        Handles three layouts we see in practice:
+          * ``ChainedOptimizer`` used when there are multiple model chunks
+            (virtual pipeline) -- we must recurse into ``chained_optimizers``
+            because the outer object's ``.state`` is empty.
+          * Megatron ``DistributedOptimizer`` whose ``state`` is a ``ProxyDict``
+            that yields ``(key, tensor)`` directly (no ``.get``).
+          * Stock torch optimizer with ``dict[param, state_dict]`` layout.
+        """
+        if self.optimizer is None:
+            return
+
+        def _walk(opt) -> None:
+            # ChainedOptimizer (Megatron VP): dispatch to inner optimizers.
+            inner = getattr(opt, "chained_optimizers", None)
+            if inner:
+                for sub in inner:
+                    _walk(sub)
+                return
+
+            state = getattr(opt, "state", None)
+            if not state:
+                return
+            for key, value in list(state.items()):
+                if isinstance(value, torch.Tensor):
+                    state[key] = value.to(device, non_blocking=True)
+                elif isinstance(value, dict):
+                    for sub_key, sub_value in value.items():
+                        if isinstance(sub_value, torch.Tensor):
+                            value[sub_key] = sub_value.to(device, non_blocking=True)
+
+        _walk(self.optimizer)
+        torch.cuda.synchronize()
+
+    @torch.no_grad()
+    def _move_module_tensors_to_device(self, device: str | torch.device) -> None:
+        """Move params/grads/buffers to ``device`` in-place.
+
+        ``nn.Module.to()`` replaces ``nn.Parameter`` objects whenever the
+        device actually changes, which silently breaks any external references
+        the optimizer (or our ``weights_backuper``) still holds to the old
+        tensors -- gradients then accumulate on GPU tensors that the optimizer
+        no longer knows about, so ``optimizer.step()`` becomes a no-op on the
+        live parameters. Mutating ``p.data`` (and ``p.grad.data``) in place
+        keeps the ``Parameter`` identity intact, so every consumer continues
+        to see the moved storage.
+
+        Additional Megatron specifics handled here:
+          * ``p.main_grad`` (used with gradient-accumulation fusion / DDP) is
+            moved alongside ``p.grad``; the optimizer reads from
+            ``main_grad`` when present.
+          * Megatron ``DistributedDataParallel`` stores parameters/grads in a
+            few big contiguous ``ParamAndGradBuffer`` tensors; individual
+            ``p.data`` / ``p.main_grad`` are views into them. Moving only the
+            views leaves the big buckets allocated on GPU and leaves the
+            views pointing at stale storage, so we also migrate each
+            buffer's underlying ``param_data`` / ``grad_data`` in place.
+        """
+        if self.model is None:
+            return
+
+        def _move_tensor_attr(owner, attr: str) -> None:
+            t = getattr(owner, attr, None)
+            if isinstance(t, torch.Tensor):
+                t.data = t.data.to(device, non_blocking=True)
+
+        for module in self.model:
+            # 1) Move DDP bucket buffers first so subsequent param views land
+            #    on the new device's storage without orphaning the buckets.
+            for bucket_attr in ("buffers", "expert_parallel_buffers"):
+                bucket_list = getattr(module, bucket_attr, None)
+                # ``buffers`` on nn.Module is a *method*; only treat it as our
+                # target when it is the Megatron list of ParamAndGradBuffer.
+                if isinstance(bucket_list, (list, tuple)):
+                    for buf in bucket_list:
+                        for t_attr in ("param_data", "grad_data"):
+                            _move_tensor_attr(buf, t_attr)
+
+            # 2) Move parameter / grad views in place (Parameter identity
+            #    preserved so optimizer + weights_backuper stay consistent).
+            for p in module.parameters(recurse=True):
+                p.data = p.data.to(device, non_blocking=True)
+                if p.grad is not None:
+                    p.grad.data = p.grad.data.to(device, non_blocking=True)
+                _move_tensor_attr(p, "main_grad")
+
+            # 3) Registered buffers (e.g. RoPE caches, norm running stats).
+            #    Use the unbound ``nn.Module.buffers`` because Megatron's DDP
+            #    shadows the method with a ``list`` of ParamAndGradBuffer.
+            for b in torch.nn.Module.buffers(module, recurse=True):
+                b.data = b.data.to(device, non_blocking=True)
+
+    def _cpu_offload_sleep(self) -> None:
+        """CPU-offload alternative to ``torch_memory_saver.pause()`` for vLLM."""
+        self._move_module_tensors_to_device("cpu")
+        if getattr(self, "optimizer", None) is not None:
+            self._move_optimizer_state_to_device("cpu")
+        torch.cuda.synchronize()
+
+    def _cpu_offload_wake_up(self) -> None:
+        """CPU-offload counterpart to ``_cpu_offload_sleep``."""
+        device = torch.cuda.current_device()
+        self._move_module_tensors_to_device(device)
+        if getattr(self, "optimizer", None) is not None:
+            self._move_optimizer_state_to_device(device)
+        torch.cuda.synchronize()
+
     @timer
     def sleep(self) -> None:
         assert self.args.offload_train
@@ -168,7 +316,11 @@ class MegatronTrainRayActor(TrainRayActor):
             self.weight_updater.disconnect_rollout_engines()
         destroy_process_groups()
 
-        torch_memory_saver.pause()
+        if self._uses_torch_memory_saver():
+            torch_memory_saver.pause()
+        else:
+            self._cpu_offload_sleep()
+            clear_memory()
 
         print_memory("after offload model")
 
@@ -177,7 +329,10 @@ class MegatronTrainRayActor(TrainRayActor):
         assert self.args.offload_train
         print_memory("before wake_up model")
 
-        torch_memory_saver.resume()
+        if self._uses_torch_memory_saver():
+            torch_memory_saver.resume()
+        else:
+            self._cpu_offload_wake_up()
 
         clear_memory()
         reload_process_groups()
@@ -588,7 +743,9 @@ class MegatronTrainRayActor(TrainRayActor):
             if dist.get_rank() == 0:
                 ray.get(self.rollout_manager.clear_updatable_num_new_engines.remote())
 
-        with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
+        weight_update_ctx = torch_memory_saver.disable() if self._uses_torch_memory_saver() else nullcontext()
+
+        with weight_update_ctx:
             print_memory("before update_weights")
             self.weight_updater.update_weights()
             print_memory("after update_weights")

@@ -9,17 +9,14 @@ from contextlib import contextmanager
 from typing import Any
 
 import numpy as np
-import pybase64
-import sglang_router
-from packaging.version import parse
 from tqdm import tqdm
 
-from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
+from slime.rollout.base_types import RolloutBackendRequest, RolloutBackendResponse, RolloutFnEvalOutput, RolloutFnTrainOutput
 from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
 from slime.utils.async_utils import run
 from slime.utils.data import Dataset
 from slime.utils.eval_config import EvalDatasetConfig
-from slime.utils.http_utils import get, post
+from slime.utils.http_utils import post
 from slime.utils.misc import SingletonMeta, load_function
 from slime.utils.processing_utils import (
     build_processor_kwargs,
@@ -33,6 +30,37 @@ from slime.utils.types import Sample
 from .rm_hub import async_rm, batched_async_rm
 
 __all__ = ["generate_rollout", "get_model_url"]
+
+
+def _get_backend_client(args):
+    backend = getattr(args, "rollout_backend", "sglang")
+    if backend == "vllm":
+        from .backends.vllm_client import VLLMClient
+        return VLLMClient(args)
+    from .backends.sglang_client import SGLangClient
+    return SGLangClient(args)
+
+
+def _apply_backend_response(sample, resp: RolloutBackendResponse, args):
+    """Apply RolloutBackendResponse to sample."""
+    sample.tokens = sample.tokens + resp.output_token_ids
+    sample.response_length += len(resp.output_token_ids)
+    sample.response += resp.text
+    if sample.loss_mask is not None:
+        assert args.partial_rollout and args.mask_offpolicy_in_partial_rollout
+        sample.loss_mask += [1] * len(resp.output_token_ids)
+    if sample.rollout_log_probs is None:
+        sample.rollout_log_probs = []
+    sample.rollout_log_probs += resp.output_token_logprobs
+    if resp.routed_experts is not None:
+        sample.rollout_routed_experts = resp.routed_experts
+    meta = {
+        "finish_reason": {"type": resp.finish_reason},
+        "prompt_tokens": resp.prompt_tokens,
+        "completion_tokens": resp.completion_tokens,
+        **{k: v for k, v in resp.backend_raw.get("meta_info", {}).items() if k not in ("finish_reason",)},
+    }
+    sample.update_from_meta_info(args, meta)
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +120,7 @@ class GenerateState(metaclass=SingletonMeta):
         self.processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
 
         self.semaphore = asyncio.Semaphore(
-            args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+            args.rollout_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
         )
         self.sampling_params: dict[str, Any] = dict(
             temperature=args.rollout_temperature,
@@ -150,13 +178,11 @@ class GenerateState(metaclass=SingletonMeta):
 
 
 async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
-    """Generate using traditional SGLang router with token-based workflow"""
+    """Generate using backend client (SGLang or vLLM)."""
     if args.ci_test:
         assert isinstance(sample.prompt, str)
 
     state = GenerateState(args)
-    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
-
     assert (
         sample.status == Sample.Status.PENDING or sample.status == Sample.Status.ABORTED
     ), f"Sample status is {sample.status}"
@@ -170,68 +196,65 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         sample.status = Sample.Status.TRUNCATED
         return sample
 
-    # Prepare payload for sglang server
-    payload = {
-        "sampling_params": sampling_params,
-        "return_logprob": True,
-    }
-
-    if args.use_rollout_routing_replay:
-        payload["return_routed_experts"] = True
-
-    images = sample.multimodal_inputs.get("images") if sample.multimodal_inputs else None
-    if images:
-        payload["image_data"] = [encode_image_for_rollout_engine(image) for image in images]
-        # For single-turn multimodal requests, send text so SGLang expands the
-        # image placeholders with its own processor rules.
-        payload["text"] = sample.prompt
-    else:
-        payload["input_ids"] = prompt_ids
-
+    input_ids = sample.tokens if len(sample.response) > 0 else prompt_ids
     if not sample.tokens:
-        sample.tokens = prompt_ids
+        sample.tokens = list(input_ids)
 
-    # Use session_id for consistent hashing routing (SGLang Model Gateway)
-    headers = None
-    if sample.session_id:
-        if getattr(args, "router_policy", None) == "consistent_hashing":
-            headers = {"X-SMG-Routing-Key": sample.session_id}
+    # Multimodal images: when present, prefer sending raw text+image_data so the
+    # backend (SGLang) expands image placeholders with its own processor rules.
+    images = sample.multimodal_inputs.get("images") if sample.multimodal_inputs else None
+    image_data = [encode_image_for_rollout_engine(img) for img in images] if images else None
 
-    with trace_span(sample, "sglang_generate", attrs={"max_new_tokens": sampling_params["max_new_tokens"]}) as span:
-        output = await post(url, payload, headers=headers)
-        span.update(build_sglang_meta_trace_attrs(output["meta_info"]))
+    use_radix = args.use_slime_router and "RadixTreeMiddleware" in getattr(args, "slime_router_middleware_paths", [])
+    if use_radix:
+        # RadixTree path: SGLang-specific, keep direct post
+        from slime.router.middleware_hub.radix_tree_middleware import postprocess_sample_with_radix_tree
 
-    if "output_token_logprobs" in output["meta_info"]:
-        new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
-        new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
-    else:
-        new_response_tokens, new_response_log_probs = [], []
-
-    # Update sample with tokens directly - avoiding re-tokenization
-    sample.tokens = sample.tokens + new_response_tokens
-    sample.response_length += len(new_response_tokens)
-    sample.response += output["text"]
-
-    # When partial rollout and masking off policy is enabled, update the loss mask
-    if sample.loss_mask is not None:
-        assert args.partial_rollout and args.mask_offpolicy_in_partial_rollout
-        sample.loss_mask += [1] * len(new_response_tokens)
-
-    if sample.rollout_log_probs is None:
-        sample.rollout_log_probs = []
-    sample.rollout_log_probs += new_response_log_probs
-
-    if "routed_experts" in output["meta_info"]:
-        sample.rollout_routed_experts = np.frombuffer(
-            pybase64.b64decode(output["meta_info"]["routed_experts"].encode("ascii")),
-            dtype=np.int32,
-        ).reshape(
-            len(sample.tokens) - 1,
-            args.num_layers,
-            args.moe_router_topk,
+        url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+        payload = {
+            "sampling_params": sampling_params,
+            "return_logprob": True,
+            "return_routed_experts": args.use_rollout_routing_replay,
+        }
+        if image_data:
+            payload["image_data"] = image_data
+            payload["text"] = sample.prompt
+        else:
+            payload["input_ids"] = input_ids
+        headers = (
+            {"X-SMG-Routing-Key": sample.session_id}
+            if getattr(args, "sglang_router_policy", None) == "consistent_hashing" and sample.session_id
+            else None
         )
-
-    sample.update_from_meta_info(args, output["meta_info"])
+        output = await post(url, payload, headers=headers)
+        sample = await postprocess_sample_with_radix_tree(args, sample, output)
+    else:
+        backend = _get_backend_client(args)
+        base_url = getattr(args, "vllm_base_url", None) or f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
+        headers = (
+            {"X-SMG-Routing-Key": sample.session_id}
+            if getattr(args, "sglang_router_policy", None) == "consistent_hashing" and sample.session_id
+            else None
+        )
+        req = RolloutBackendRequest(
+            input_ids=input_ids,
+            text=sample.prompt if image_data else None,
+            sampling_params=sampling_params,
+            return_logprob=True,
+            return_routed_experts=args.use_rollout_routing_replay,
+            image_data=image_data,
+            session_id=sample.session_id,
+        )
+        with trace_span(
+            sample,
+            "rollout_generate",
+            attrs={"max_new_tokens": sampling_params["max_new_tokens"]},
+        ) as span:
+            resp = await backend.generate(req, base_url, headers=headers)
+            meta_info = resp.backend_raw.get("meta_info") if isinstance(resp.backend_raw, dict) else None
+            if meta_info:
+                span.update(build_sglang_meta_trace_attrs(meta_info))
+        _apply_backend_response(sample, resp, args)
 
     return sample
 
@@ -344,24 +367,19 @@ async def generate_and_rm_group(
 
 async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     aborted_samples = []
-
     state = GenerateState(args)
     assert not state.aborted
     state.aborted = True
 
-    if parse(sglang_router.__version__) <= parse("0.2.1"):
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
-        urls = response["urls"]
-    else:
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
-        urls = [worker["url"] for worker in response["workers"]]
-
-    logger.info(f"Abort request for {urls}")
-    abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
-    abort_results = await asyncio.gather(*abort_tasks, return_exceptions=True)
-    for url, result in zip(urls, abort_results, strict=False):
-        if isinstance(result, Exception):
-            logger.warning(f"Failed to abort worker at {url}: {result}")
+    backend = _get_backend_client(args)
+    urls = await backend.abort()
+    if urls:
+        logger.info(f"Abort request for {urls}")
+        abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
+        abort_results = await asyncio.gather(*abort_tasks, return_exceptions=True)
+        for url, result in zip(urls, abort_results, strict=False):
+            if isinstance(result, Exception):
+                logger.warning(f"Failed to abort worker at {url}: {result}")
 
     # make sure all the pending tasks are finished
     count = 0
