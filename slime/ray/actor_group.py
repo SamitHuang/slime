@@ -50,16 +50,45 @@ class RayTrainGroup:
         assert pg is not None
         pg, reordered_bundle_indices, _reordered_gpu_ids = pg
 
+        # Restrict CUDA_VISIBLE_DEVICES to only this group's GPUs so that
+        # NCCL / PyTorch do not allocate memory on rollout GPUs.
+        trainer_gpu_ids = [_reordered_gpu_ids[rank] for rank in range(world_size)]
+        trainer_cvd = ",".join(str(g) for g in trainer_gpu_ids)
+
         env_vars = {
             # because sglang will always set NCCL_CUMEM_ENABLE to 0
             # we need also set it to 0 to prevent nccl error.
             "NCCL_CUMEM_ENABLE": os.environ.get("NCCL_CUMEM_ENABLE", "0"),
             "NVTE_FP8_BLOCK_SCALING_FP32_SCALES": os.environ.get("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "1"),
             **{name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST},
+            "CUDA_VISIBLE_DEVICES": trainer_cvd,
             **self.args.train_env_vars,
         }
 
-        if self.args.offload_train and self.args.train_backend == "megatron":
+        # if self.args.offload_train and self.args.train_backend == "megatron":
+        #     import torch_memory_saver
+
+        #     dynlib_path = os.path.join(
+        #         os.path.dirname(os.path.dirname(torch_memory_saver.__file__)),
+        #         "torch_memory_saver_hook_mode_preload.abi3.so",
+        #     )
+        #     assert os.path.exists(dynlib_path), f"LD_PRELOAD so file {dynlib_path} does not exist."
+
+        #     env_vars["LD_PRELOAD"] = dynlib_path
+        #     env_vars["TMS_INIT_ENABLE"] = "1"
+        #     env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
+
+        # torch_memory_saver requires an LD_PRELOAD'd allocator hook. It is only
+        # used when offloading the trainer for the sglang rollout backend. With
+        # the vLLM rollout backend we instead fall back to an explicit CPU
+        # offload path inside the Megatron actor (see ``MegatronTrainRayActor``
+        # ``sleep`` / ``wake_up``), so we must NOT preload the .so here.
+        rollout_backend = getattr(self.args, "rollout_backend", "sglang")
+        if (
+            self.args.offload_train
+            and self.args.train_backend == "megatron"
+            and rollout_backend != "vllm"
+        ):
             import torch_memory_saver
 
             dynlib_path = os.path.join(

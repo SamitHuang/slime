@@ -1,5 +1,9 @@
+import logging
+import torch.multiprocessing as mp
+import os
 import socket
 import time
+import traceback
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 
@@ -15,6 +19,155 @@ from slime.utils.distributed_utils import get_gloo_group, init_process_group
 
 from ..megatron_to_hf import convert_to_hf
 from .common import all_gather_param, named_params_and_buffers
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# NcclBridge: isolate vLLM's PyNcclCommunicator in a subprocess so that it
+# never coexists with torch.distributed NCCL groups in the Megatron trainer.
+#
+# vLLM's weight transfer uses raw NCCL (PyNcclCommunicator) which conflicts
+# with torch.distributed's NCCL backend when both exist in the same process
+# (see https://github.com/vllm-project/vllm/issues/5477).  sglang avoids
+# this because it uses torch.distributed process groups for weight sync.
+# ---------------------------------------------------------------------------
+
+
+def _nccl_bridge_worker(conn, master_address, master_port, world_size, device, cvd, env_snapshot):
+    """Subprocess entry-point: creates PyNcclCommunicator and serves requests.
+
+    GPU tensors are shared from the parent via CUDA IPC (torch.multiprocessing
+    handles this transparently).  No GPU→CPU→GPU copies are needed.
+
+    Protocol over *conn* (multiprocessing.Connection):
+        parent → child:
+            {"op": "broadcast", "tensors": [gpu_tensor, ...]}
+            {"op": "send_packed", "named_tensors": [(name, gpu_tensor), ...]}
+            None  → shutdown
+        child → parent:
+            "ready"  (after init)
+            "ok"     (after each op)
+            "error: <msg>"
+    """
+    try:
+        os.environ.update(env_snapshot)
+        if cvd:
+            os.environ["CUDA_VISIBLE_DEVICES"] = cvd
+
+        import torch
+        import torch.multiprocessing  # ensure CUDA IPC reducers are registered
+        torch.cuda.set_device(device)
+
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+        from vllm.distributed.utils import StatelessProcessGroup
+
+        pg = StatelessProcessGroup.create(
+            host=master_address, port=master_port, rank=0, world_size=world_size,
+        )
+        comm = PyNcclCommunicator(pg, device=device)
+
+        conn.send("ready")
+
+        while True:
+            cmd = conn.recv()
+            if cmd is None:
+                break
+
+            op = cmd["op"]
+            if op == "broadcast":
+                for t in cmd["tensors"]:
+                    comm.broadcast(t, src=0, stream=torch.cuda.current_stream())
+                torch.cuda.synchronize()
+                conn.send("ok")
+
+            elif op == "send_packed":
+                from vllm.distributed.weight_transfer.nccl_engine import (
+                    NCCLTrainerSendWeightsArgs,
+                    NCCLWeightTransferEngine,
+                )
+
+                trainer_args = NCCLTrainerSendWeightsArgs(
+                    group=comm,
+                    packed=True,
+                )
+                NCCLWeightTransferEngine.trainer_send_weights(
+                    iterator=iter(cmd["named_tensors"]),
+                    trainer_args=trainer_args,
+                )
+                torch.cuda.synchronize()
+                conn.send("ok")
+
+    except Exception as e:
+        try:
+            conn.send(f"error: {e}")
+        except Exception:
+            pass
+        traceback.print_exc()
+
+
+class _NcclBridge:
+    """Runs vLLM's PyNcclCommunicator in a separate subprocess.
+
+    This prevents NCCL communicator conflicts with torch.distributed groups
+    that already exist in the Megatron trainer process.  GPU tensors are shared
+    with the subprocess via CUDA IPC (handled transparently by
+    torch.multiprocessing), avoiding any GPU→CPU→GPU copies.
+    """
+
+    def __init__(self, master_address: str, master_port: int, world_size: int, device: int):
+        ctx = mp.get_context("spawn")
+        self._parent_conn, child_conn = ctx.Pipe()
+
+        # Pass the full environment so the subprocess inherits all NCCL, CUDA,
+        # and networking settings from the trainer (set by Ray runtime_env).
+        env_snapshot = dict(os.environ)
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+
+        self._process = ctx.Process(
+            target=_nccl_bridge_worker,
+            args=(child_conn, master_address, master_port, world_size, device, cvd, env_snapshot),
+            daemon=True,
+        )
+        self._process.start()
+
+        msg = self._parent_conn.recv()
+        if isinstance(msg, str) and msg.startswith("error:"):
+            raise RuntimeError(f"NcclBridge init failed: {msg}")
+        if msg != "ready":
+            raise RuntimeError(f"NcclBridge init unexpected response: {msg}")
+        logger.info("NcclBridge ready (pid=%d, device=%d)", self._process.pid, device)
+
+    def broadcast_tensors(self, tensors: list[torch.Tensor]) -> None:
+        """Broadcast a list of tensors (one-by-one) via the bridge subprocess."""
+        gpu_tensors = [t.contiguous() for t in tensors]
+        self._parent_conn.send({"op": "broadcast", "tensors": gpu_tensors})
+        self._wait_ok("broadcast_tensors")
+
+    def send_weights_packed(self, named_tensors: list[tuple[str, torch.Tensor]]) -> None:
+        """Send weights using vLLM's packed broadcast protocol."""
+        gpu_pairs = []
+        for name, t in named_tensors:
+            data = t.data if hasattr(t, "data") else t
+            gpu_pairs.append((name, data.contiguous()))
+        self._parent_conn.send({"op": "send_packed", "named_tensors": gpu_pairs})
+        self._wait_ok("send_weights_packed")
+
+    def _wait_ok(self, label: str, timeout: float = 600.0) -> None:
+        if not self._parent_conn.poll(timeout):
+            raise TimeoutError(f"NcclBridge {label} timed out after {timeout}s")
+        msg = self._parent_conn.recv()
+        if msg != "ok":
+            raise RuntimeError(f"NcclBridge {label} failed: {msg}")
+
+    def shutdown(self) -> None:
+        try:
+            self._parent_conn.send(None)
+            self._process.join(timeout=30)
+        except Exception:
+            pass
+        if self._process.is_alive():
+            self._process.terminate()
 
 
 class UpdateWeightFromDistributed:
@@ -98,34 +251,52 @@ class UpdateWeightFromDistributed:
                 )
         dist.barrier(group=get_gloo_group())
 
-        buffer_size = 0
-        converted_named_tensors = []
-        # non expert params
-        pbar = tqdm(desc=f"[{self._group_name}] Update weights", total=0) if self._is_pp_src_rank else None
+        use_vllm_packed = self._use_vllm_packed()
+        if use_vllm_packed and self._is_pp_src_rank:
+            logger.info("Using vLLM packed weight sync (one-shot metadata + trainer_send_weights)")
+        if use_vllm_packed:
+            # vLLM packed path: gather all non-expert params, one-shot update (aligned with vLLM New Weight Syncing)
+            converted_named_tensors = []
+            for name, param in named_params_and_buffers(self.args, self.model):
+                if ".experts." in name:
+                    continue
+                param = all_gather_param(name, param)
+                if self._is_pp_src_rank:
+                    converted_named_tensors += convert_to_hf(
+                        self.args, self.model_name, name, param, self.quantization_config
+                    )
+            if converted_named_tensors and self._is_pp_src_rank:
+                self._update_weights_vllm_packed(converted_named_tensors)
+        else:
+            buffer_size = 0
+            converted_named_tensors = []
+            pbar = tqdm(desc=f"[{self._group_name}] Update weights", total=0) if self._is_pp_src_rank else None
 
-        for name, param in named_params_and_buffers(self.args, self.model):
-            if ".experts." in name:
-                continue
-            buffer_size = self._update_weight_from_distributed(
-                name, param, converted_named_tensors, buffer_size, pbar=pbar
-            )
+            for name, param in named_params_and_buffers(self.args, self.model):
+                if ".experts." in name:
+                    continue
+                buffer_size = self._update_weight_from_distributed(
+                    name, param, converted_named_tensors, buffer_size, pbar=pbar
+                )
 
-        if converted_named_tensors:
-            self._update_bucket_weights_from_distributed(converted_named_tensors, pbar=pbar)
+            if converted_named_tensors:
+                self._update_bucket_weights_from_distributed(converted_named_tensors, pbar=pbar)
 
         dist.barrier(group=get_gloo_group())
 
-        buffer_size = 0
-        named_tensors = []
-        for name, param in named_params_and_buffers(self.args, self.model):
-            if ".experts." not in name:
-                continue
-            buffer_size = self._update_expert_weight_from_distributed(
-                name, param, named_tensors, buffer_size, pbar=pbar
-            )
+        if not use_vllm_packed:
+            buffer_size = 0
+            named_tensors = []
+            pbar = tqdm(desc=f"[{self._group_name}] Update weights (experts)", total=0) if self._is_pp_src_rank else None
+            for name, param in named_params_and_buffers(self.args, self.model):
+                if ".experts." not in name:
+                    continue
+                buffer_size = self._update_expert_weight_from_distributed(
+                    name, param, named_tensors, buffer_size, pbar=pbar
+                )
 
-        if named_tensors:
-            self._update_expert_bucket_weights_from_distributed(named_tensors, pbar=pbar)
+            if named_tensors:
+                self._update_expert_bucket_weights_from_distributed(named_tensors, pbar=pbar)
 
         dist.barrier(group=get_gloo_group())
         if dist.get_rank() == 0:
@@ -162,6 +333,41 @@ class UpdateWeightFromDistributed:
         converted_named_tensors += convert_to_hf(self.args, self.model_name, name, param, self.quantization_config)
         buffer_size += param_size
         return buffer_size
+
+    def _use_vllm_packed(self) -> bool:
+        """Use vLLM packed weight transfer (one-shot metadata + trainer_send_weights)."""
+        if not _is_vllm_backend(self.args):
+            return False
+        if not getattr(self.args, "vllm_weight_sync_packed", True):
+            return False
+        # MoE models need expert path, skip packed
+        if any(".experts." in name for name, _ in named_params_and_buffers(self.args, self.model)):
+            return False
+        # compressed-tensors needs pre/post process
+        if self.quantization_config and self.quantization_config.get("quant_method") == "compressed-tensors":
+            return False
+        return True
+
+    def _update_weights_vllm_packed(
+        self, converted_named_tensors: list[tuple[str, torch.Tensor]]
+    ) -> None:
+        """Single-shot vLLM weight update using packed broadcast (aligned with vLLM New Weight Syncing)."""
+        while not ray.get(self.rollout_engine_lock.acquire.remote()):
+            time.sleep(0.1)
+
+        try:
+            refs = update_weights_from_distributed(
+                self._group_name,
+                self._model_update_groups,
+                self.weight_version,
+                self.rollout_engines,
+                converted_named_tensors,
+                use_vllm=True,
+                packed=True,
+            )
+            ray.get(refs)
+        finally:
+            ray.get(self.rollout_engine_lock.release.remote())
 
     def _update_expert_weight_from_distributed(
         self,
@@ -241,12 +447,17 @@ class UpdateWeightFromDistributed:
             self.weight_version,
             self.rollout_engines,
             converted_named_tensors,
+            use_vllm=_is_vllm_backend(self.args),
         )
 
         ray.get(refs)
         converted_named_tensors.clear()
         ray.get(self.rollout_engine_lock.release.remote())
         pbar.update(1)
+
+
+def _is_vllm_backend(args: Namespace) -> bool:
+    return getattr(args, "rollout_backend", "sglang") == "vllm"
 
 
 def connect_rollout_engines_from_distributed(
@@ -261,6 +472,11 @@ def connect_rollout_engines_from_distributed(
     ``engine_gpu_counts`` gives the number of GPUs per engine.  When engines
     have heterogeneous TP sizes (e.g. prefill TP=2, decode TP=4), each engine
     occupies a different number of ranks in the NCCL group.
+
+    For vLLM backend, the trainer-side NCCL communicator is created inside a
+    separate subprocess (_NcclBridge) to avoid conflicts between vLLM's raw
+    NCCL (PyNcclCommunicator) and the torch.distributed NCCL groups that
+    Megatron already holds in this process.
     """
     if engine_gpu_counts is None:
         engine_gpu_counts = [args.rollout_num_gpus_per_engine] * len(rollout_engines)
@@ -276,6 +492,7 @@ def connect_rollout_engines_from_distributed(
     for c in engine_gpu_counts:
         cumulative.append(cumulative[-1] + c)
 
+    # Fire engine init remotes first (non-blocking Ray calls).
     refs = [
         engine.init_weights_update_group.remote(
             master_address,
@@ -287,13 +504,38 @@ def connect_rollout_engines_from_distributed(
         )
         for i, engine in enumerate(rollout_engines)
     ]
-    model_update_groups = init_process_group(
-        backend="nccl",
-        init_method=f"tcp://{master_address}:{master_port}",
-        world_size=world_size,
-        rank=0,
-        group_name=group_name,
-    )
+
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
+    if _is_vllm_backend(args):
+        # vLLM uses StatelessProcessGroup + PyNcclCommunicator (raw NCCL).
+        # Creating PyNcclCommunicator in the Megatron trainer process would
+        # conflict with torch.distributed's NCCL groups (issue #5477).
+        # Instead, we spawn a bridge subprocess that owns the PyNcclCommunicator,
+        # keeping the trainer process free of raw NCCL communicators.
+        device = torch.cuda.current_device()
+        logger.info(
+            "vLLM weight transfer via NcclBridge: addr=%s port=%d "
+            "world_size=%d device=%d CVD=%s",
+            master_address, master_port, world_size, device,
+            os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>"),
+        )
+        model_update_groups = _NcclBridge(
+            master_address=master_address,
+            master_port=master_port,
+            world_size=world_size,
+            device=device,
+        )
+    else:
+        model_update_groups = init_process_group(
+            backend="nccl",
+            init_method=f"tcp://{master_address}:{master_port}",
+            world_size=world_size,
+            rank=0,
+            group_name=group_name,
+        )
+
     ray.get(refs)
     return model_update_groups
 
@@ -303,36 +545,56 @@ def disconnect_rollout_engines_from_distributed(args, group_name, model_update_g
     Destroy NCCL on training and engines.
     """
     refs = [engine.destroy_weights_update_group.remote(group_name) for engine in rollout_engines]
-    dist.destroy_process_group(model_update_groups)
+    if _is_vllm_backend(args):
+        if isinstance(model_update_groups, _NcclBridge):
+            model_update_groups.shutdown()
+        model_update_groups = None
+    else:
+        dist.destroy_process_group(model_update_groups)
     ray.get(refs)
 
 
 def update_weights_from_distributed(
     group_name: str,
-    group: dist.ProcessGroup,
+    group,
     weight_version: int,
     rollout_engines: Sequence[ActorHandle],
     converted_named_tensors: Sequence[tuple[str, torch.Tensor]],
+    use_vllm: bool = False,
+    packed: bool = False,
 ) -> list[ObjectRef]:
     """
     Send metadata (Ray), broadcast tensors (NCCL rank 0 → engines).
+
+    For vLLM the *group* is an ``_NcclBridge`` instance (subprocess) so that
+    raw NCCL never runs inside the Megatron trainer process.
+    For sglang the *group* is a ``torch.distributed.ProcessGroup``.
     """
+    kwargs = {
+        "names": [name for name, _ in converted_named_tensors],
+        "dtypes": [param.dtype for _, param in converted_named_tensors],
+        "shapes": [param.shape for _, param in converted_named_tensors],
+        "group_name": group_name,
+        "weight_version": str(weight_version),
+    }
+    if use_vllm:
+        kwargs["packed"] = packed
+
     refs = [
-        engine.update_weights_from_distributed.remote(
-            names=[name for name, _ in converted_named_tensors],
-            dtypes=[param.dtype for _, param in converted_named_tensors],
-            shapes=[param.shape for _, param in converted_named_tensors],
-            group_name=group_name,
-            weight_version=str(weight_version),
-        )
+        engine.update_weights_from_distributed.remote(**kwargs)
         for engine in rollout_engines
     ]
 
-    handles = []
-    for _, param in converted_named_tensors:
-        handles.append(dist.broadcast(param.data, 0, group=group, async_op=True))
-    for handle in handles:
-        handle.wait()
+    if use_vllm and packed:
+        group.send_weights_packed(converted_named_tensors)
+    elif use_vllm:
+        group.broadcast_tensors([param.data for _, param in converted_named_tensors])
+    else:
+        handles = []
+        for _, param in converted_named_tensors:
+            handles.append(dist.broadcast(param.data, 0, group=group, async_op=True))
+        for handle in handles:
+            handle.wait()
 
     return refs
 

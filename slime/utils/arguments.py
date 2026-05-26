@@ -5,10 +5,7 @@ import os
 from typing import Any
 
 import yaml
-from sglang_router.launch_router import RouterArgs
 
-from slime.backends.sglang_utils.arguments import sglang_parse_args
-from slime.backends.sglang_utils.arguments import validate_args as sglang_validate_args
 from slime.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
 from slime.utils.logging_utils import configure_logger
 
@@ -237,6 +234,45 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "If not set, we will use `type(AutoConfig.from_pretrained(args.hf_checkpoint)).__name__.lower()` as model_name. "
                     "Also, sometimes this will help alleviate the bug that transformers cannot find certain model."
                 ),
+            )
+            parser.add_argument(
+                "--rollout-backend",
+                type=str,
+                choices=["sglang", "vllm"],
+                default="sglang",
+                help="Rollout inference backend: sglang (default) or vllm.",
+            )
+            parser.add_argument(
+                "--vllm-base-url",
+                type=str,
+                default=None,
+                help="vLLM server URL (set automatically when using managed vLLM).",
+            )
+            parser.add_argument(
+                "--vllm-max-retries",
+                type=int,
+                default=3,
+                help="Max HTTP retries for vLLM requests.",
+            )
+            parser.add_argument(
+                "--vllm-weight-sync-packed",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help="Use vLLM packed weight transfer for non-colocate (default: True). Disable for per-bucket mode.",
+            )
+            parser.add_argument(
+                "--vllm-gpu-memory-utilization",
+                type=float,
+                default=0.4,
+                help="Fraction of GPU memory for vLLM KV cache (default: 0.85). "
+                     "Lower this if the training model leaves insufficient free memory.",
+            )
+            parser.add_argument(
+                "--rollout-server-concurrency",
+                type=int,
+                default=512,
+                help="Maximum number of concurrent requests sent to the rollout server. "
+                     "Controls request parallelism for any backend (sglang or vllm).",
             )
             parser.add_argument(
                 "--rollout-function-path",
@@ -1037,7 +1073,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=3,
                 help="Number of consecutive failures before marking a worker as unhealthy.",
             )
-            RouterArgs.add_cli_args(parser, use_router_prefix=True, exclude_host_port=True)
+            try:
+                from sglang_router.launch_router import RouterArgs
+
+                RouterArgs.add_cli_args(parser, use_router_prefix=True, exclude_host_port=True)
+            except ImportError:
+                pass  # sglang not installed — router args unavailable (vllm-only mode)
             return parser
 
         # wandb
@@ -1431,6 +1472,7 @@ def _pre_parse_mode():
     temp_parser.add_argument("--debug-rollout-only", action="store_true", default=False)
     temp_parser.add_argument("--debug-train-only", action="store_true", default=False)
     temp_parser.add_argument("--load-debug-rollout-data", type=str, default=None)
+    temp_parser.add_argument("--rollout-backend", type=str, choices=["sglang", "vllm"], default="sglang")
     temp_args, _ = temp_parser.parse_known_args()
     return temp_args
 
@@ -1442,12 +1484,18 @@ def parse_args(add_custom_arguments=None):
     add_slime_arguments = get_slime_extra_args_provider(add_custom_arguments)
 
     pre = _pre_parse_mode()
-    skip_sglang = pre.debug_train_only or pre.load_debug_rollout_data is not None
+    skip_sglang = (
+        pre.debug_train_only
+        or pre.load_debug_rollout_data is not None
+        or pre.rollout_backend == "vllm"
+    )
 
     # Phase 1: Parse sglang args independently (separate parser, parse_known_args).
-    # Skipped when sglang servers are not needed.
+    # Skipped when sglang servers are not needed or when using vLLM backend.
     sglang_ns = None
     if not skip_sglang:
+        from slime.backends.sglang_utils.arguments import sglang_parse_args
+
         sglang_ns = sglang_parse_args()
 
     # Phase 2: Parse megatron/fsdp + slime args.
@@ -1484,8 +1532,18 @@ def parse_args(add_custom_arguments=None):
     if pre.train_backend == "megatron" and not args.debug_rollout_only:
         megatron_validate_args(args)
 
-    if not args.debug_train_only:
+    if not args.debug_train_only and getattr(args, "rollout_backend", "sglang") == "sglang":
+        from slime.backends.sglang_utils.arguments import validate_args as sglang_validate_args
+
         sglang_validate_args(args)
+    elif getattr(args, "rollout_backend", "sglang") == "vllm":
+        # Set sglang aliases that the rest of the codebase expects
+        args.sglang_dp_size = getattr(args, "sglang_data_parallel_size", 1) or 1
+        args.sglang_pp_size = getattr(args, "sglang_pipeline_parallel_size", 1) or 1
+        args.sglang_ep_size = getattr(args, "sglang_expert_parallel_size", 1) or 1
+        args.sglang_tp_size = args.rollout_num_gpus_per_engine
+        if not hasattr(args, "sglang_speculative_algorithm"):
+            args.sglang_speculative_algorithm = None
 
     return args
 
@@ -1704,7 +1762,7 @@ def slime_validate_args(args):
         args.offload_train = False
     if args.offload_rollout is None:
         args.offload_rollout = False
-
+    args.offload_rollout = False 
     if args.eval_function_path is None:
         args.eval_function_path = args.rollout_function_path
 
